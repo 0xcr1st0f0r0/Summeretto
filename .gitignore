@@ -1,0 +1,38 @@
+# ── 凭证与临时产物（⚠️ 含 token、登录态、APK 等敏感/大体积文件）──
+out/
+*.token
+
+# ── APK 逆向素材（258MB，不随仓库分发；按需从 apk/ 目录本地取用）──
+apk/
+
+# ── 环境变量（各个目录都可能放）──
+.env
+.env.*
+!.env.example
+
+# ── 凭证与登录态残留（深度防御：即使误放到别的目录也拦得住）──
+*.pem
+*.keystore
+*.jks
+gsa-credentials.json
+oauth-token.txt
+robin-token.txt
+login-profile*/
+Edge Wallet/
+
+# ── 依赖与运行时 ──
+node_modules/
+.vercel
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+
+# ── 编辑器 ──
+.vscode/
+.idea/
+
+# ── 系统/临时 ──
+nohup.out
+*.tmp
+*.swp

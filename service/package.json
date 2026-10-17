@@ -1,0 +1,16 @@
+{
+  "name": "summeretto",
+  "private": true,
+  "type": "module",
+  "description": "Summeretto — 基于 Google 祖传 Robin 协议魔改的高性能夏日网关（Gemini 原生格式 HTTP API）；当前部署：与 Eidolon 同机自托管（systemd robin-proxy，仅回环）",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test/run.mjs && node test/e2e.mjs",
+    "test:unit": "node test/run.mjs",
+    "test:e2e": "node test/e2e.mjs",
+    "probe": "node scripts/probe.mjs"
+  }
+}
