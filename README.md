@@ -378,6 +378,20 @@ curl -s http://127.0.0.1:3000/healthz | python3 -c \
 sudo systemctl restart summeretto  # （或你配置的 systemd unit 名称）
 ```
 
+<br>
+
+### 🐳 Docker 自托管
+
+`service/` 目录已内置 `Dockerfile` / `docker-compose.yml` / `docker-entrypoint.sh`，
+零依赖、无需 `npm install`。凭证支持**环境变量注入**（默认）与**`.env` 持久化**（Docker 配置项 `CREDENTIAL_PERSIST` 一键开关）。
+
+```bash
+cd service
+docker compose up -d --build
+```
+
+完整构建、运行与持久化说明见 **[`service/Docker.md`](service/Docker.md)**。
+
 ---
 
 ## ◆ Quota Reality · 配额真相：算力纪元的清醒法则
