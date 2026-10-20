@@ -1,0 +1,42 @@
+# 可选：OpenAI 兼容桥（与 docker-compose.yml 相互独立，可单独启用）
+#
+# 主服务只暴露 Gemini 原生格式；不少第三方客户端只认 OpenAI 那一套
+# （POST /v1/chat/completions + GET /v1/models）。本文件把兼容桥单独拉起，
+# 不改动 docker-compose.yml，也不改动主服务任何代码。
+#
+# 启用（假设主服务已在宿主机 3000 端口发布）：
+#   docker compose -f docker-compose.openai-shim.yml up -d
+#
+# 客户端填：Base URL = http://127.0.0.1:8081/v1   API Key = 任意字符串
+name: summeretto-shim
+
+services:
+  openai-shim:
+    image: node:22-slim
+    container_name: summeretto-openai-shim
+    restart: unless-stopped
+    working_dir: /app
+    command: ["node", "openai-shim.mjs"]
+    environment:
+      # 容器内必须监听 0.0.0.0；只听 127.0.0.1 的话端口映射打不通
+      SHIM_HOST: "0.0.0.0"
+      SHIM_PORT: "8081"
+      # 经宿主机已发布端口回连主服务；主服务换端口时改这里或用同名环境变量覆盖。
+      # Linux 上 host.docker.internal 可能需补：
+      #   extra_hosts: ["host.docker.internal:host-gateway"]
+      UPSTREAM: "${UPSTREAM:-http://host.docker.internal:3000}"
+      # ★ 补偿上游空正文的重试。默认值来自一轮实测（见 OpenAI-compat.md「实测与调优」），
+      #   **换网络 / 换账号 / 换时段后建议重新实测再定，不要照抄。**
+      EMPTY_RETRY: "1"
+      EMPTY_RETRY_DELAY_MS: "500"
+    volumes:
+      - ./openai-shim.mjs:/app/openai-shim.mjs:ro
+    ports:
+      - "8081:8081"
+    healthcheck:
+      # 用 /healthz（会真正回连上游），不要用 /v1/models 走缓存
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8081/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
