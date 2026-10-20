@@ -37,6 +37,7 @@ import { config } from "./config.js";
 const state = {
   logical: 0,       // 走过甄别逻辑的逻辑请求数
   emptyEvents: 0,   // 空响应事件数（每次物理尝试各计一次）
+  transientEvents: 0, // 瞬时可重试的上游业务错误事件数（如「地域不可用 ZZ」）
   retries: 0,       // 实际发起的重试次数
   successes: 0,     // 重试后恢复成功的请求数
   exhausted: 0,     // 重试耗尽（最终仍为空响应）的请求数
@@ -93,31 +94,49 @@ export async function withEmptyRetry(attemptFn, opts = {}) {
 
   state.logical++;
   let attempt = 0;
+  let lastFailKind = "空响应"; // 供成功日志描述上一次失败是什么形态
+  const t0 = Date.now();
   for (;;) {
     attempt++;
     const result = await attemptFn(attempt);
-    const isEmpty = result?.__modeVerdict?.state === "empty";
-    if (!isEmpty) {
+    // ★ 会触发重试的两种形态（其余一律不重试）：
+    //   ① empty     —— HTTP 200/STOP、无正文、无 #30（上游静默拒答）
+    //   ② transient —— 上游**明确拒答**但属瞬时可恢复（如「地域不可用 ZZ」）
+    //      ⇒ 推理根本没跑、**零额度消耗**，重试几乎无代价且实测可恢复。
+    const vState = result?.__modeVerdict?.state;
+    const isEmpty = vState === "empty";
+    const isTransient = vState === "transient";
+    const retryable = isEmpty || isTransient;
+    const elapsed = Date.now() - t0;
+    if (!retryable) {
       if (attempt > 1) {
         state.successes++;
-        log(`[empty-retry] ✓ 第 ${attempt} 次尝试成功（本请求共空 ${attempt - 1} 次）—— 判为偶发故障，已自愈`);
+        log(
+          `[empty-retry] ✓ 第 ${attempt} 次尝试成功（本请求前 ${attempt - 1} 次为` +
+          `${lastFailKind}，累计 ${elapsed}ms）—— 判为偶发故障，已自愈`
+        );
       }
       return result;
     }
-    state.emptyEvents++;
+    lastFailKind = isTransient ? "瞬时错误" : "空响应";
+    if (isTransient) state.transientEvents++;
+    else state.emptyEvents++;
     const d = decideEmptyRetry({ attempt, deadline, maxRetries: max, reserveMs });
     if (!d.retry) {
       state.exhausted++;
       if (d.reason === "budget") state.budgetStopped++;
       log(
-        `[empty-retry] ✗ ${attempt} 次尝试均为空响应（${d.reason === "budget" ? "超预算" : `重试上限 ${max}`}` +
-        `${d.reason === "disabled" ? "，重试已关闭" : ""}）→ 放弃重试，交上层处置（资源型可能性高）`
+        `[empty-retry] ✗ ${attempt} 次尝试均为${isTransient ? "瞬时错误" : "空响应"}` +
+        `（${d.reason === "budget" ? "超预算" : `重试上限 ${max}`}` +
+        `${d.reason === "disabled" ? "，重试已关闭" : ""}）→ 放弃重试，交上层处置` +
+        ` [累计 ${elapsed}ms / 预算 ${config.robinEmptyRetryBudgetMs}ms / 预留 ${reserveMs}ms]`
       );
       return result;
     }
     state.retries++;
     log(
-      `[empty-retry] ⚠️ 空响应（第 ${attempt}/${1 + max} 次尝试）→ 自动重试` +
+      `[empty-retry] ⚠️ ${isTransient ? "上游瞬时错误" : "空响应"}` +
+      `（第 ${attempt}/${1 + max} 次尝试，累计 ${elapsed}ms）→ 自动重试` +
       `${delayMs > 0 ? `（${delayMs}ms 后）` : "（立即）"}`
     );
     if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
@@ -128,6 +147,7 @@ export async function withEmptyRetry(attemptFn, opts = {}) {
 export function __resetEmptyRetryForTest() {
   state.logical = 0;
   state.emptyEvents = 0;
+  state.transientEvents = 0;
   state.retries = 0;
   state.successes = 0;
   state.exhausted = 0;

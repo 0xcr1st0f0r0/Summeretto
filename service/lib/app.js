@@ -286,6 +286,13 @@ async function attemptRobin(body, onDelta, modeId = null, thinkingLevel = null) 
   let prev = "";
   const result = await processQuery({
     frames,
+    // ★ 结束条件（2026-10-20 二改，见 lib/robin.js）：
+    //   · 总时限 300s；首正文前**不再有独立宽限**（默认等到总时限）
+    //   · 结束只由：上游终止会话 / EOS 标记 / 正文完成标记（Lgapu.#19=2）
+    //     / 上游真空 / 总时限 到 —— 我方静默定时器**不再把「上游慢」掐成空回复**。
+    idleMs: config.robinIdleMs,
+    firstIdleMs: config.robinIdleFirstMs,
+    idleAfterTextMs: config.robinIdleAfterTextMs,
     onFrame: (evt) => {
       if (evt.kind !== "response" || !evt.texts?.length) return;
       const cum = evt.texts[evt.texts.length - 1]; // 一帧内取最长者
@@ -309,6 +316,10 @@ async function attemptRobin(body, onDelta, modeId = null, thinkingLevel = null) 
   console.log(
     `[resp] ${result.model ?? "(无 #30)"} rank=${result.rank ?? "-"} thinkEcho=${result.thinking ?? "-"}` +
     ` effMode=${result.effectiveMode ?? "-"}` +
+    // ★ 结束方式（2026-10-20）：complete = 正文完成标记（Lgapu.#19=2），
+    //   eos = 上游 EOS 标记，idle = 静默兜底，timeout = 总时限到。
+    //   「complete/eos」= 上游明确说答完了（确定性）；后两者才是超时类。
+    ` endedBy=${result.endedBy ?? "-"}${result.complete ? " (完成标记)" : ""}${result.eos ? " (EOS)" : ""}` +
     (modeDowngraded
       ? (hasAudioAttachment
         ? " ⓘ 降级属预期（音频退让：Argon 读不到音频）"
