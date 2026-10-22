@@ -29,6 +29,8 @@
 //
 // ⚠️ 调参提示：EMPTY_RETRY / EMPTY_RETRY_DELAY_MS 的默认值来自本机一轮实测，
 //    **换网络、换账号、换时段后建议重新实测再定**，不要照抄。方法见 OpenAI-compat.md。
+//    注：主服务 79b5ce3「根治空回复」已修掉根因（空回复率实测 0%），桥侧重试
+//    现仅作轻量保险，默认 1 次即可。
 
 import { createServer } from "node:http";
 
