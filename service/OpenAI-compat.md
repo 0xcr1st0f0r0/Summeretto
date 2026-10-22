@@ -119,6 +119,30 @@ API Key  = 任意字符串
 上游 `79b5ce3` 未改 `ROBIN_EMPTY_RETRY_DELAY_MS` 的默认值（仍为 0），
 但根因已修的前提下该延迟不再是关键路径。
 
+#### 修复后本地实测（上游含 `79b5ce3`）
+
+20 个**互不相同**的 prompt（否则会撞 90s 响应缓存，见 §5.5）：
+
+| 指标 | 结果 |
+|---|---|
+| 客户端可见空回复 | **0/20 = 0%** |
+| 上游内部空事件 | 2 次，`endedBy:"server-end"`、`idleCutBeforeText:false`、诊断 **E**（上游静默拒答·账号资源态） |
+| 这 2 次的归宿 | 均被桥侧重试救回，客户端无感 |
+
+诊断 **E** 与旧的「A2 空闲截断」是**不同类问题**：A2 是我方定时器误杀（已修），
+E 是上游主动沉默（账号资源态），**调重试参数解决不了**，只能重试或换账号。
+
+分档位延迟（各 5 次不同 prompt）：
+
+| 档位 | 平均延迟 |
+|---|---|
+| `3.5-flash-lite` | ~3.6s（与上游 README §9.3 的 3.2~3.4s 吻合） |
+| `3.8-flash` | ~4.8s |
+| `4-argon` | ~13s |
+
+> 上游修复的代价是**等得久但不再丢内容**：慢上游现在能正常返回，代价是等待时间变长。
+> 追求快请用 `3.8-flash` / `3.5-flash-lite`，`4-argon` 本身就是最慢档位。
+
 ### 5.3 ★ 仍需注意：不要让两层重试叠乘
 
 若你的环境仍出现空回复（未升级、或走自建上游），主服务与桥都有重试，**会叠乘**：
@@ -138,27 +162,36 @@ API Key  = 任意字符串
 
 ### 5.5 怎么自己实测
 
+> ⚠️ **测延迟必须用互不相同的 prompt。** 主服务带 90s 响应缓存
+> （`/healthz → dedup.ttlMs=90000`，含 `cached` / `hits` 计数），
+> 相同 prompt 在 TTL 内会直接命中缓存，测出来的是**缓存命中耗时**而非推理耗时。
+> 本组件初稿时就因此把 48ms 误当成推理延迟，真实值差两个数量级。
+
 ```bash
-# 连续 N 次，统计空响应率与延迟
+# 连续 N 次，**每次 prompt 都要不同**（绕过 90s 响应缓存）
 for i in $(seq 1 20); do
   s=$(date +%s%N)
   n=$(curl -s -X POST "$BASE/v1/chat/completions" -H 'content-type: application/json' \
-    -d '{"model":"4-argon","messages":[{"role":"user","content":"说三个字"}]}' \
+    -d "{\"model\":\"4-argon\",\"messages\":[{\"role\":\"user\",\"content\":\"#$i 用三个字说什么在发光\"}]}" \
     | python -c "import sys,json;print(len(json.load(sys.stdin)['choices'][0]['message']['content']))")
   echo "$i $(( ($(date +%s%N)-s)/1000000 ))ms len=$n"
 done
 
-# 主服务侧的空响应/重试计数
+# 主服务侧的空响应/重试/缓存计数
 curl -s "$UPSTREAM/healthz" | python -c \
-  "import sys,json;d=json.load(sys.stdin);print(d['emptyRetry']);print(d['degradeGuard'])"
+  "import sys,json;d=json.load(sys.stdin);print(d['emptyRetry']);print(d['degradeGuard']);print(d['dedup'])"
 ```
 
 判据：
 
+- **延迟低得可疑（几十毫秒）** → 多半撞了响应缓存，看 `dedup.hits`；
 - **空响应率高** → 先确认主服务是否已含 `79b5ce3`；未升级**先升级，别急着调参**；
 - 升级后仍空 → 看 `/healthz → degradeGuard.lastEmpty.diagnosis`：
-  `A2` = 我方超时截断（上游只是慢，可调 `ROBIN_IDLE_FIRST_MS`）、`D` = 真·盲区扩展；
-- **延迟不可接受** → 优先减桥的 `EMPTY_RETRY`，而不是减主服务的；
+  `A2` = 我方超时截断（上游只是慢，可调 `ROBIN_IDLE_FIRST_MS`）、
+  **`E` = 上游静默拒答（账号资源态），调参无用**、
+  `D` = 真·盲区扩展；
+- **延迟不可接受** → 优先减桥的 `EMPTY_RETRY`；若整体都慢则换更快的档位
+  （`3.8-flash` 约 4.8s，`4-argon` 约 13s）；
 - 观测点：`/healthz → emptyRetry` 给出 `emptyEvents / retries / successes / exhausted`，
   修复后新增 `transientEvents`（上游明确拒答但可瞬时恢复，如「地域不可用 ZZ」）。
 
