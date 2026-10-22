@@ -45,6 +45,10 @@ const state = {
   lastEmpty: null,   // 最近一次空响应详情（含插桩字段）
   authFailures: 0,   // ★「凭证失效型」空响应累计（2026-10-17 实测新增，见判定 ⑤）
   lastAuthFailure: null,
+  timeouts: 0,       // ★ 达到总时限（300s）仍未出正文的次数（上游极慢，非拒答）
+  lastTimeout: null,
+  transients: 0,     // ★ 瞬时可重试的上游业务错误（如「地域不可用 ZZ」）
+  lastTransient: null,
 };
 
 // ───────────────────────────── 对外接口 ─────────────────────────────
@@ -71,11 +75,48 @@ function isAuthFailure(r) {
 }
 
 /**
+ * 「瞬时可重试」的上游业务错误（2026-10-20 新增）。
+ *
+ * 实测到的两类（均为**明确拒答**、推理没跑 ⇒ **零额度消耗**，重试几乎无代价）：
+ *   ① `BardStatusException: This service is not yet available in your location ZZ.`
+ *      —— 上游按出口 IP 的**地理判定**偶发失败（ZZ = 未能判定所在区域）。
+ *      实测约每 20 次请求命中 1 次，2~3s 内返回。
+ *   ② `BardStatusException: Agency connection failed: ... throttled:
+ *       Service is overloaded (memory-protection)`（grpc=13）
+ *      —— 上游 agent 调度器过载（内存保护），实测 ~1.2s 内返回。
+ *
+ * 为什么要单独归类：
+ *   · 它们**不是**空回复（HTTP 200/STOP/无正文），而是 gRPC 业务错误 ⇒ 原有
+ *     「空回复重试」不会触发，调用方直接拿到 502（用户侧表现为「发送失败」）。
+ *   · 但它们**明确拒答、推理根本没跑** ⇒ 零额度消耗，重试几乎无代价，
+ *     且实测重试即可恢复（与空回复同属「偶发故障」性质）。
+ *   ⇒ 归入 transient：让 empty-retry 一并重试（同模型同档位）。
+ *
+ * ⚠️ 判定要窄：只匹配明确的「过载 / 地域不可用」措辞，避免把真正的业务错误
+ *   （如账号被封、参数非法）也拿去重试 —— 那些重试无用且会浪费额度。
+ */
+const TRANSIENT_UPSTREAM_PATTERNS = [
+  /not yet available in your location/i,
+  /location ZZ/i,
+  /Service is overloaded/i,
+  /memory-protection/i,
+  /Agency connection failed/i,
+  /\bthrottled\b/i,
+];
+
+function isTransientUpstream(r) {
+  if (!r) return false;
+  const text = `${r.error ?? ""} ${r.grpcMessage ?? ""}`;
+  if (!text.trim()) return false;
+  return TRANSIENT_UPSTREAM_PATTERNS.some((re) => re.test(text));
+}
+
+/**
  * 响应后调用（app.js 的 attemptRobin 尾部）：判定本次请求是否被静默降级 /
  * 空响应，只记录与上报，不做任何换将/重试/置窗动作。
  * 裁决挂在 result.__modeVerdict 上供 lib/empty-retry.js 触发【同模型】重试
- * （state === "empty" 是唯一会触发重试的形态；降级不透传重试）。
- * @returns {{state: 'ok'|'degraded'|'empty'|'auth-failure'|'unknown'|'off', requestedId?: string,
+ * （state === "empty" 或 "transient" 是会触发重试的两种形态；降级不透传重试）。
+ * @returns {{state: 'ok'|'degraded'|'empty'|'transient'|'timeout'|'auth-failure'|'unknown'|'off', requestedId?: string,
  *            requestedLabel?: string|null, effectiveId?: string|null,
  *            model?: string|null, exempt?: string}}
  */
@@ -90,13 +131,21 @@ export function noteResponse({ requestedModeId, result, hasAudioAttachment }) {
 
   // ── 判定 ──
   let vState;
+  // ★ ⑤ 达到总时限（2026-10-20）：等待上限 300s 用尽仍未出正文。
+  //   与「上游真空 / 静默拒答」是**不同**的形态（我们等满了，不是上游先收手），
+  //   故独立计数，方便判断「上游到底有多慢」。
+  if (result?.endedBy === "timeout") {
+    vState = "timeout";
   // ★ ⑤ 凭证失效型（2026-10-17 实测新增，必须排在 empty 之前）：
   //   no-token 短路 —— 无可用 ya29 令牌，请求根本没发出去（robin.js 的
   //   `endedBy:"no-token"` / `grpcStatus:"UNAUTHENTICATED"` 分支），或
   //   令牌过期后上游鉴权层拒绝。两种都【零额度消耗】——与 ③ 的「上游真空」
   //   性质完全不同（③ 大概率已计费），历史上曾被混为一谈导致误判为配额问题。
-  if (isAuthFailure(result)) {
+  } else if (isAuthFailure(result)) {
     vState = "auth-failure";
+  } else if (isTransientUpstream(result)) {
+    // ★ 瞬时可重试的上游业务错误（如「地域不可用 ZZ」）—— 明确拒答、零计费
+    vState = "transient";
   } else if (eff) {
     vState = eff === reqId ? "ok" : "degraded";
   } else if (/flash-lite/i.test(model)) {
@@ -135,9 +184,15 @@ export function noteResponse({ requestedModeId, result, hasAudioAttachment }) {
       unknownFrames: result?.unknownFrames ?? 0,
       extCounts: result?.extCounts ?? {},
       endedBy: result?.endedBy ?? null,
+      // ★ 我方 idle 定时器在正文出现前掐断 ⇒ 「慢」被误报成「空」
+      idleCutBeforeText: Boolean(result?.idleCutBeforeText),
+      sawText: Boolean(result?.sawText),
     };
-    // ── 分流判据（三类互斥，按可能性排序）──
+    // ── 分流判据（互斥，按可能性排序）──
     //  A. frames=0                      → 上游真空，一个字节都没给（非我方问题）
+    //  A2. idleCutBeforeText            → ★ 我方空闲定时器在正文出现前掐断
+    //     （2026-10-20 新增）：上游只是**慢**，不是拒答。修法：加大
+    //     ROBIN_IDLE_FIRST_MS（首正文前的宽限），而不是加重试。
     //  B. unknown>0 或 controlFrames>0   → 帧到了但分类层就没认出来（需修 parseServerFrame）
     //  C. 有 1003 但 texts=0              → 1003 结构变了 / oneof 落在空分支（需修 extractResponse）
     //  D. exts 里出现 1003 以外的扩展且无文本 → ★ 文本可能落在未处理的扩展里
@@ -145,27 +200,49 @@ export function noteResponse({ requestedModeId, result, hasAudioAttachment }) {
     //      extractResponse 只处理 1000 与 1003；ext1004/1008=Lgcwv、1012=Lgcxe、
     //      1014=Lgcve、1002=Lgcwm 均为 oneof 容器，若上游把文本改走这些通道即静默丢失）
     const extKeys = Object.keys(result?.extCounts ?? {});
-    const knownText = extKeys.includes("1003");
+    // ★ 「收到过内容容器帧」用 contentFrames 判定，**不能**用 extCounts 里有没有
+    //   "1003"：3 字节的空 ext1003{}（开始帧）与 EOS 帧也计在 1003 上，
+    //   但它们都不含 Lfzrc —— 用 extCounts 判会把「上游没出正文」误报成
+    //   「我方解析失败」。
+    const contentFrames = result?.contentFrames ?? 0;
+    const knownText = contentFrames > 0;
     const foreignExt = extKeys.filter((k) => k !== "1003");
+    // 已知的「非正文」扩展：1000=能力表 ACK、1014=会话 id 握手帧 —— 它们出现
+    // **不代表**文本落在那里（2026-10-20 实测：健康响应的帧序恒为
+    // 1000(ACK) → 1003(空 oneof) → 1014(会话 id) ×2 → 1003(正文) …）。
+    // 旧逻辑把它们算作「盲区扩展」，把「上游慢/真空」误报成「文本落在
+    // 未解明的数据包里」——正是排查空回复时最大的误导来源。
+    const BENIGN_EXT = new Set(["1000", "1014"]);
+    const suspiciousExt = foreignExt.filter((k) => !BENIGN_EXT.has(k));
     let verdictLine;
     if ((result?.frames ?? 0) === 0) {
       verdictLine = "【A 上游真空】未收到任何帧 → 非解析问题（推理未被接受，或上游主动掐流）";
+    } else if (result?.idleCutBeforeText) {
+      verdictLine =
+        "【A2 空闲截断】已收到帧但正文迟迟未到，被本端 idle 定时器掐断" +
+        " → 上游只是**慢**（非拒答）；加大 ROBIN_IDLE_FIRST_MS 即可";
     } else if ((result?.unknownFrames ?? 0) > 0 || (result?.controlFrames ?? 0) > 0) {
       verdictLine = "【B 分类层丢弃】帧已到达但未被识别 → 需修 parseServerFrame";
     } else if (knownText) {
       verdictLine = "【C 结构变化】收到 ext1003 但解析不出文本 → 需修 extractResponse";
-    } else if (foreignExt.length > 0) {
+    } else if (suspiciousExt.length > 0) {
       verdictLine =
-        `【D 盲区扩展】收到未处理的扩展 ext${foreignExt.join(",ext")}（文本可能在此通道）` +
+        `【D 盲区扩展】收到未处理的扩展 ext${suspiciousExt.join(",ext")}（文本可能在此通道）` +
         " → 需扩展 extractResponse";
     } else {
-      verdictLine = "【E 未知】有帧但无任何扩展字段，需抓原始 payload 复核";
+      verdictLine =
+        "【E 上游未出正文】收到帧（含握手帧）但无正文且未触发本地超时" +
+        " → 上游静默拒答（账号资源态），非解析问题";
     }
-    state.lastEmpty.diagnosis = verdictLine.slice(0, 2).replace(/【|】/g, "");
+    // 诊断代号：取【】里的整段（如 A / A2 / B / C / D / E），不是固定 2 字符
+    state.lastEmpty.diagnosis = (verdictLine.match(/^【\s*([A-Z0-9]+)/)?.[1]) ?? "?";
+    // ★ 诊断全文也留一份（diagnosis 只是 2 字母代号，排查时要看得懂）
+    state.lastEmpty.diagnosisText = verdictLine;
     console.log(
       `[guard] ⚠️ 上游返回「空响应」（无 #30、无正文，HTTP 200/STOP）` +
       ` [诊断] frames=${result?.frames ?? 0} unknown=${result?.unknownFrames ?? 0}` +
       ` control=${result?.controlFrames ?? 0} exts=${exts} endedBy=${result?.endedBy ?? "?"}` +
+      ` idleCut=${result?.idleCutBeforeText ? "yes" : "no"}` +
       ` ⇒ ${verdictLine}（累计 ${state.emptyReplies} 次）`
     );
     // ── 取证：原始帧 hex 落日志（仅空响应时，零常态开销）──
@@ -182,6 +259,40 @@ export function noteResponse({ requestedModeId, result, hasAudioAttachment }) {
     } else {
       console.log(`[guard]   ↳ raw=(无原始帧缓冲，capture 关闭或真空)`);
     }
+    return verdict;
+  }
+
+  // ── ★ 瞬时可重试的上游业务错误（如「地域不可用 ZZ」）：独立计数 ──
+  //   明确拒答、推理没跑 ⇒ 零额度消耗；重试几乎无代价且实测可恢复。
+  if (vState === "transient") {
+    state.transients++;
+    const hint = String(result?.error ?? result?.grpcMessage ?? "").slice(0, 200);
+    state.lastTransient = { at: Date.now(), requestedId: requestedModeId, hint };
+    console.log(
+      `[guard] 🔄 上游瞬时业务错误（可重试，零额度消耗）：${hint}` +
+      `（累计 ${state.transients} 次）`
+    );
+    return verdict;
+  }
+
+  // ── ★ 达到总时限（300s）仍未出正文：独立计数与告警 ──
+  //   与「上游真空 / 静默拒答」不同 —— 这是**我们等满了**，不是上游先收手。
+  //   可观测性意义：直接回答「上游到底能慢到什么程度」。
+  if (vState === "timeout") {
+    state.timeouts++;
+    state.lastTimeout = {
+      at: Date.now(),
+      requestedId: requestedModeId,
+      requestedLabel: entry?.label ?? null,
+      frames: result?.frames ?? 0,
+      extCounts: result?.extCounts ?? {},
+      error: String(result?.error ?? "").slice(0, 200),
+    };
+    console.log(
+      `[guard] ⏱ 达到总时限仍未出正文（等待上限 ${config.robinTimeoutMs}ms）` +
+      ` frames=${result?.frames ?? 0} exts=${JSON.stringify(result?.extCounts ?? {})}` +
+      ` ⇒ 上游极慢（非拒答）（累计 ${state.timeouts} 次）`
+    );
     return verdict;
   }
 
@@ -256,6 +367,12 @@ export function guardStatus() {
     //   排查时先看这个——非 0 即代表 robin 通道已不可用。
     authFailures: state.authFailures,
     lastAuthFailure: state.lastAuthFailure,
+    // ★ 达到总时限（ROBIN_TIMEOUT_MS，默认 300s）仍未出正文
+    timeouts: state.timeouts,
+    lastTimeout: state.lastTimeout,
+    // ★ 瞬时可重试的上游业务错误（如「地域不可用 ZZ」；零额度消耗）
+    transients: state.transients,
+    lastTransient: state.lastTransient,
   };
 }
 
@@ -266,4 +383,8 @@ export function __resetGuardForTest() {
   state.lastEmpty = null;
   state.authFailures = 0;
   state.lastAuthFailure = null;
+  state.timeouts = 0;
+  state.lastTimeout = null;
+  state.transients = 0;
+  state.lastTransient = null;
 }

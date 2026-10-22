@@ -107,40 +107,56 @@ export async function mintAccessToken(force = false) {
     return state.minted.token || "";
   }
 
-  try {
-    const res = await performOauth({
-      email: gsa.email,
-      masterToken: gsa.masterToken,
-      androidId: androidIdFor(),
-      service: config.gsaService || ASSISTANT_SERVICE,
-      app: config.gsaApp || AGSA_PKG,
-    });
+  // ★ 重试一次（2026-10-20 实测）：android.clients.google.com 偶发 20s 超时
+  //   （同一时刻同一凭证在另一个进程里 0.6s 就铸成功 ⇒ 是**瞬时网络/端点抖动**，
+  //   不是凭证失效）。旧实现一超时就直接判失败 ⇒ 该次请求零额度返回 502，
+  //   且（配合当时 dedup 的缓存缺陷）后续 90s 的同 payload 请求全被重放成同一错误。
+  //   ⇒ 这里对「网络类失败」重试一次（仅网络错误，不对 403 BadAuthentication 重试 ——
+  //   那是凭证真的被撤销，重试无用）。
+  const ATTEMPTS = 2;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      const res = await performOauth({
+        email: gsa.email,
+        masterToken: gsa.masterToken,
+        androidId: androidIdFor(),
+        service: config.gsaService || ASSISTANT_SERVICE,
+        app: config.gsaApp || AGSA_PKG,
+      });
+      if (!res.token || !res.token.startsWith("ya29.")) {
+        state.minted.error =
+          `perform_oauth 未返回 ya29 令牌（HTTP ${res.status}）` +
+          (res.fields.Error ? `：${res.fields.Error}` : "");
+        noteMintFailure(state.minted.error);
+        console.warn("[auth]", state.minted.error, JSON.stringify(res.fields).slice(0, 400));
+        return state.minted.token || ""; // 保留旧值，聊胜于无
+      }
 
-    if (!res.token || !res.token.startsWith("ya29.")) {
-      state.minted.error =
-        `perform_oauth 未返回 ya29 令牌（HTTP ${res.status}）` +
-        (res.fields.Error ? `：${res.fields.Error}` : "");
-      noteMintFailure(state.minted.error);
-      console.warn("[auth]", state.minted.error, JSON.stringify(res.fields).slice(0, 400));
-      return state.minted.token || ""; // 保留旧值，聊胜于无
+      const ttlMs = (res.expiresInSec ?? 3600) * 1000;
+      state.minted = {
+        token: res.token,
+        expiresAt: Date.now() + ttlMs,
+        mintedAt: Date.now(),
+        error: null,
+      };
+      noteMintSuccess();
+      console.log(`[auth] 已用 master token 换取新访问令牌（TTL ${ttlMs / 1000}s）`);
+      return res.token;
+    } catch (err) {
+      lastErr = err;
+      const transient = /超时|timeout|ECONN|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(
+        String(err?.message ?? err)
+      );
+      if (!transient || attempt === ATTEMPTS) break;
+      console.warn(`[auth] 取令牌遇瞬时网络错误（${err?.message}），${800 * attempt}ms 后重试一次`);
+      await new Promise((r) => setTimeout(r, 800 * attempt));
     }
-
-    const ttlMs = (res.expiresInSec ?? 3600) * 1000;
-    state.minted = {
-      token: res.token,
-      expiresAt: Date.now() + ttlMs,
-      mintedAt: Date.now(),
-      error: null,
-    };
-    noteMintSuccess();
-    console.log(`[auth] 已用 master token 换取新访问令牌（TTL ${ttlMs / 1000}s）`);
-    return res.token;
-  } catch (err) {
-    state.minted.error = `mint 失败：${err?.message}`;
-    noteMintFailure(state.minted.error);
-    console.warn("[auth]", state.minted.error);
-    return state.minted.token || "";
   }
+  state.minted.error = `mint 失败：${lastErr?.message}`;
+  noteMintFailure(state.minted.error);
+  console.warn("[auth]", state.minted.error);
+  return state.minted.token || "";
 }
 
 /** 记录一次铸造失败（供 healthz 判定；不改变任何请求行为）。 */

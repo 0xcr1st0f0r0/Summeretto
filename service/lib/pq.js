@@ -791,7 +791,28 @@ export const RESP_EXT = Object.freeze({
 export function extractResponse(lgcvqBytes) {
   const out = { texts: [], ops: [], hasExt: {}, byExt: {}, ackCapabilities: null,
     cumulative: null, language: null, conversationId: null, responseId: null, title: null, model: null,
-    rank: null, thinking: null, effectiveMode: null };
+    rank: null, thinking: null, effectiveMode: null,
+    // ★ 流结束标记（2026-10-20 实证）：上游在**最后一帧**发
+    //   Lgcvq[ext1003] Lgcvc{ #2 = <空 godw> }（oneof 落在 case2）
+    //   ⇒ 这是「答完了」的**确定性**信号，不再需要靠 idle 静默超时收尾。
+    //   实测帧序（健康响应，8/8 一致）：
+    //     ext1000(ACK) → ext1003(空 3B) → ext1014(会话id)×2 → ext1003(正文)×N
+    //     → ext1003{Lgcvc.#2 空} (EOS)
+    //   ⚠️ 与「开始帧」区分：3 字节的 ext1003{}（oneof 未设）是开始标记，不是 EOS。
+    eos: false,
+    // ★★ 「正文已完整」标记（2026-10-20 实证，141 个响应 810 帧）
+    //   Lgapu.#19：1 = 分片进行中，**2 = 该分片已完成**。
+    //   · 首个 #19=2 的帧**即含全部文本**（139/141），其后 0 例再增长
+    //     ⇒ 见到它就可以**确定性收尾**，不必再靠静默超时猜「答完了没」。
+    //   · 实测每帧**恒为单分片**（810/810）⇒ 「该帧所有分片都 #19=2」即全文完成。
+    //   ⚠️ 若将来出现多分片，本字段只在「同一帧内全部 #19=2」时才置位。
+    complete: false,
+    // ★ 本帧是否带**内容容器**（Lgcvc.#1 = Lfzrc）——区分
+    //   「收到了正文容器却解不出文本（我方解析问题）」与
+    //   「只收到握手帧 / 空 oneof 帧，上游根本没出正文（上游拒答或本地超时）」。
+    //   ⚠️ 不能用 extCounts 里有没有 "1003" 判断：3 字节的空 ext1003{}（开始帧）
+    //   与 EOS 帧也计在 1003 上，但它们都不含内容。
+    lfzrcSeen: false };
   for (const f of decodeFields(lgcvqBytes)) {
     out.hasExt[f.no] = (out.hasExt[f.no] ?? 0) + 1;
     out.byExt[f.no] ??= [];
@@ -826,8 +847,15 @@ export function extractResponse(lgcvqBytes) {
     if (f.no === 1003) {
       // Lgcvc { oneof: #1 Lfzrc | #2 godw(空) }
       const lfzrcF = fieldOne(f.value, 1);
-      if (!lfzrcF) continue; // case2 = 空控制帧
+      if (!lfzrcF) {
+        // ★ oneof 落在 case2（#2 = 空 godw）⇒ 上游的**流结束标记**（见函数头注释）。
+        //   注意区分：3 字节的 ext1003{}（一个字段都没有）是「开始帧」，不是结束帧。
+        const godw = fieldOne(f.value, 2);
+        if (godw) out.eos = true;
+        continue; // case2 = 空控制帧
+      }
       const lfzrc = lfzrcF.value;
+      out.lfzrcSeen = true;
       // ★ 2026-10-15 probe24/25 实证结构：
       //   Lfzrc {
       //     #1[] Lgapu {                       ← 候选分片（repeated）
@@ -842,7 +870,10 @@ export function extractResponse(lgcvqBytes) {
       //     #30 STRING = 'Used 3.5 Flash-Lite model'
       //     #41 varint, #42 varint, #45 varint
       //   }
+      let allShardsDone = true;
+      let shardCount = 0;
       for (const gapu of fieldAll(lfzrc, 1)) {
+        shardCount++;
         const gace = fieldOne(gapu.value, 2);           // Lgace
         if (gace && gace.wt === 2) {
           const t = fieldOne(gace.value, 1);
@@ -852,7 +883,13 @@ export function extractResponse(lgcvqBytes) {
         if (cum && cum.wt === 2 && cum.value.length) out.cumulative = asString(cum.value);
         const lang = fieldOne(gapu.value, 20);
         if (lang && lang.wt === 2) out.language = asString(lang.value);
+        // ★ 分片状态：#19 == 2 ⇒ 该分片已完成（见函数头 complete 注释）
+        const v19 = fieldOne(gapu.value, 19);
+        if (!(v19 && v19.wt === 0 && Number(asUint(v19.value)) === 2)) allShardsDone = false;
       }
+      // 只有「本帧**有分片**且全部 #19=2」才判定正文完整
+      //   ⚠️ 帧里一个 Lgapu 都没有时不得判定完成（否则会提前收尾）。
+      if (shardCount > 0 && allShardsDone) out.complete = true;
       const gavc = fieldOne(lfzrc, 2);                  // Lgavc{会话/响应 id}
       if (gavc && gavc.wt === 2) {
         const cid = fieldOne(gavc.value, 1);
