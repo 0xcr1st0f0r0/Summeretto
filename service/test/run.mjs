@@ -42,6 +42,8 @@ import {
   inflightStatus, resetInflight,
   enterRequest, exitRequest,
 } from "../lib/inflight.js";
+import { extractResponse } from "../lib/pq.js";
+import { idleLimitFor } from "../lib/robin.js";
 
 let n = 0;
 const ok = (m) => {
@@ -1634,5 +1636,193 @@ ok("★ 幂等去重（同 payload 重发 ⇒ 零上游调用；空响应/错误
   assert.deepEqual(inflightStatus(), { inflight: 0, peak: 0, totalStarted: 0 });
   ok("§21 在途请求计数（inflight/peak/totalStarted；防负、峰值不回退）");
 }
+
+/* ── §22 流结束标记（EOS）+ 空闲宽限三态（2026-10-20）────────────────────
+ *
+ * 背景：空回复的**头号自造来源**是本端 idle 定时器把「上游慢」掐成「上游拒答」。
+ *   根因：旧实现对「还没出正文」与「正文已结束」用同一个 10s idle。
+ *   修法两件套：
+ *     ① 空闲宽限分三态（正文前耐心等）；
+ *     ② 认上游的**流结束标记** ext1003{Lgcvc.#2 空} ⇒ 确定性收尾，
+ *        既不误截断，也不再靠超时猜「答完了没」。
+ * ─────────────────────────────────────────────────────────────────────── */
+{
+  // (a) EOS 帧：ext1003 → Lgcvc{ #2 = <空 godw> } ⇒ eos=true
+  const eosFrame = new Writer().message(1003, new Writer().bytes(2, new Uint8Array(0)).finish()).finish();
+  const exEos = extractResponse(eosFrame);
+  assert.equal(exEos.eos, true, "Lgcvc.#2 空应识别为流结束标记");
+  assert.equal(exEos.texts.length, 0, "EOS 帧不含文本");
+
+  // (b) 开始帧：ext1003 → Lgcvc{}（3 字节，oneof 未设）⇒ **不是** EOS
+  const startFrame = new Writer().message(1003, new Uint8Array(0)).finish();
+  const exStart = extractResponse(startFrame);
+  assert.equal(exStart.eos, false, "空的 Lgcvc（开始帧）不得被当成 EOS");
+
+  // (c) 内容帧 ⇒ 不是 EOS
+  //    结构：Lgcvq[ext1003] Lgcvc{ #1 Lfzrc{ #1 Lgapu{ #2 Lgace{ #1 文本 } } } }
+  const lgapu = new Writer().message(2, new Writer().string(1, "你好").finish()).finish();
+  const lfzrc = new Writer().message(1, lgapu).finish();
+  const lgcvc = new Writer().message(1, lfzrc).finish();
+  const contentFrame = new Writer().message(1003, lgcvc).finish();
+  const exContent = extractResponse(contentFrame);
+  assert.equal(exContent.eos, false, "内容帧不得被当成 EOS");
+  assert.equal(exContent.texts[0], "你好", "内容帧应解析出文本");
+
+  ok("§22 (a-c) 流结束标记识别（EOS=Lgcvc.#2 空；开始帧/内容帧不误判）");
+
+  // (d) 空闲宽限三态
+  assert.equal(idleLimitFor({ sawText: false, frames: 0, idleMs: 10_000, firstIdleMs: 60_000 }), 10_000,
+    "frames=0（上游没接单）应快速失败（短 idle）");
+  assert.equal(idleLimitFor({ sawText: false, frames: 4, idleMs: 10_000, firstIdleMs: 60_000 }), 60_000,
+    "已收到 ACK/握手帧但正文未出 ⇒ 用长宽限（不得掐流）");
+  assert.equal(idleLimitFor({ sawText: true, frames: 9, idleMs: 10_000, firstIdleMs: 60_000 }), 10_000,
+    "正文已开始 ⇒ 未给兜底宽限时退回常规 idle");
+  assert.equal(idleLimitFor({ sawText: false, frames: 4, idleMs: 30_000, firstIdleMs: 10_000 }), 30_000,
+    "长宽限不得短于常规 idle");
+  ok("§22 (d) 空闲宽限三态（真空快速失败 / 正文前耐心 / 正文后收尾）");
+
+  // (d2) 2026-10-20 二改：首正文前的等待上限 = 总时限（300s）；正文后用兜底宽限
+  assert.equal(idleLimitFor({ sawText: false, frames: 4, idleMs: 10_000, firstIdleMs: 300_000 }), 300_000,
+    "已受理的请求应一路等到 300s 上限（不再被静默定时器掐断）");
+  assert.equal(idleLimitFor({ sawText: true, frames: 9, idleMs: 10_000, firstIdleMs: 300_000, idleAfterTextMs: 30_000 }), 30_000,
+    "正文已开始 ⇒ 用兜底宽限（正常路径由完成标记/EOS 收尾）");
+  ok("§22 (d2) 等待上限 300s（首正文前）/ 正文后兜底宽限");
+
+  // (d3) 「正文已完整」标记：Lgapu.#19 == 2
+  const gapuDone = new Writer()
+    .message(2, new Writer().string(1, "答完了").finish())
+    .varint(19, 2)
+    .finish();
+  const frameDone = new Writer()
+    .message(1003, new Writer().message(1, new Writer().message(1, gapuDone).finish()).finish())
+    .finish();
+  assert.equal(extractResponse(frameDone).complete, true, "Lgapu.#19=2 应判定正文已完整");
+
+  const gapuBusy = new Writer()
+    .message(2, new Writer().string(1, "还在写").finish())
+    .varint(19, 1)
+    .finish();
+  const frameBusy = new Writer()
+    .message(1003, new Writer().message(1, new Writer().message(1, gapuBusy).finish()).finish())
+    .finish();
+  assert.equal(extractResponse(frameBusy).complete, false, "Lgapu.#19=1 不得判定正文已完整");
+  assert.equal(extractResponse(frameBusy).eos, false, "内容帧也不是 EOS");
+
+  // 帧里一个 Lgapu 都没有（只有 Lfzrc 外壳）⇒ 不得判定完成（否则提前收尾）
+  const frameNoShard = new Writer()
+    .message(1003, new Writer().message(1, new Writer().finish()).finish())
+    .finish();
+  assert.equal(extractResponse(frameNoShard).complete, false, "无分片的帧不得判定正文已完整");
+  ok("§22 (d3) 「正文已完整」标记（Lgapu.#19=2）识别 —— 确定性收尾依据");
+
+  // (e) 空回复分流：idle 截断必须被单独标出，且不得误报「文本在未解明扩展里」
+  __resetGuardForTest();
+  const vCut = noteResponse({
+    requestedModeId: "8c46e95b1a07cecc",
+    result: {
+      frames: 4, unknownFrames: 0, controlFrames: 0,
+      extCounts: { 1000: 1, 1003: 1, 1014: 2 },
+      endedBy: "idle", idleCutBeforeText: true, sawText: false,
+      texts: [],
+    },
+    hasAudioAttachment: false,
+  });
+  assert.equal(vCut.state, "empty", "空闲截断仍属 empty 类");
+  const le = guardStatus().lastEmpty;
+  assert.equal(le.idleCutBeforeText, true, "lastEmpty 应记录 idleCutBeforeText");
+  assert.equal(le.diagnosis, "A2", "诊断代号应为 A2（空闲截断）");
+  assert.ok(le.diagnosisText.includes("空闲截断"), "诊断全文应说明是「空闲截断」");
+  assert.ok(!le.diagnosisText.includes("盲区扩展"),
+    "ext1000/1014 是握手帧（ACK/会话 id），不得再被报成「文本落在未解明的数据包里」");
+  ok("§22 (e) 空回复分流：空闲截断独立成类；握手帧不再误报为盲区扩展");
+
+  // (f) 握手帧但未被本地超时掐断 ⇒ 【E 上游未出正文】（真·静默拒答）
+  __resetGuardForTest();
+  noteResponse({
+    requestedModeId: "8c46e95b1a07cecc",
+    result: {
+      frames: 4, unknownFrames: 0, controlFrames: 0,
+      extCounts: { 1000: 1, 1003: 1, 1014: 2 },
+      endedBy: "idle", idleCutBeforeText: false, sawText: false,
+      texts: [],
+    },
+    hasAudioAttachment: false,
+  });
+  const le2 = guardStatus().lastEmpty;
+  assert.equal(le2.diagnosis, "E", "非本地超时的无正文 ⇒ E（上游未出正文）");
+  assert.ok(!le2.diagnosisText.includes("盲区扩展"), "握手帧不得被报成盲区扩展");
+  ok("§22 (f) 真·静默拒答（E）与本地超时截断（A2）严格分流");
+
+  // (g) 达到总时限（300s）仍未出正文 ⇒ 独立计数（timeout），不混入 empty
+  __resetGuardForTest();
+  const vTmo = noteResponse({
+    requestedModeId: "8c46e95b1a07cecc",
+    result: {
+      frames: 4, unknownFrames: 0, controlFrames: 0,
+      extCounts: { 1000: 1, 1003: 1, 1014: 2 },
+      endedBy: "timeout", idleCutBeforeText: false, sawText: false,
+      error: "总超时（300000ms）",
+      texts: [],
+    },
+    hasAudioAttachment: false,
+  });
+  assert.equal(vTmo.state, "timeout", "总时限耗尽应判为 timeout 而非 empty");
+  assert.equal(guardStatus().timeouts, 1, "timeout 应独立计数");
+  assert.equal(guardStatus().emptyReplies, 0, "timeout 不得计入 emptyReplies");
+  ok("§22 (g) 总时限（300s）耗尽独立计数（timeout），与空回复分流");
+
+  // (h) 瞬时可重试的上游业务错误（如「地域不可用 ZZ」）⇒ transient
+  __resetGuardForTest();
+  const vTr = noteResponse({
+    requestedModeId: "8c46e95b1a07cecc",
+    result: {
+      frames: 0, unknownFrames: 0, controlFrames: 0, extCounts: {},
+      endedBy: "end", grpcStatus: "9",
+      error: "gRPC 状态 9: com.google.assistant.boq.bard.application.utils.BardStatusException: " +
+             "This service is not yet available in your location ZZ.",
+      texts: [],
+    },
+    hasAudioAttachment: false,
+  });
+  assert.equal(vTr.state, "transient", "地域不可用应判为 transient（可重试）");
+  assert.equal(guardStatus().transients, 1, "transient 应独立计数");
+  assert.equal(guardStatus().emptyReplies, 0, "transient 不得计入 emptyReplies");
+  assert.equal(guardStatus().authFailures, 0, "transient 不是鉴权失败");
+
+  // (h2) 同类的「上游过载」错误（memory-protection / throttled）也算 transient
+  __resetGuardForTest();
+  const vTr2 = noteResponse({
+    requestedModeId: "8c46e95b1a07cecc",
+    result: {
+      frames: 0, unknownFrames: 0, controlFrames: 0, extCounts: {},
+      endedBy: "end", grpcStatus: "13",
+      error: "gRPC 状态 13: BardStatusException: Agency connection failed: " +
+             "Request '/AgentDispatcherService.Connect' from role 'bard-agents-server' throttled: " +
+             "Service is overloaded (memory-protection)",
+      texts: [],
+    },
+    hasAudioAttachment: false,
+  });
+  assert.equal(vTr2.state, "transient", "上游过载（memory-protection）应判为 transient");
+  assert.equal(guardStatus().transients, 1, "transient 计数应累加");
+  ok("§22 (h2) 上游过载（Agency connection failed / memory-protection）同样归为 transient");
+
+  // (h3) 真正的业务错误（不可重试）不得被误判成 transient
+  __resetGuardForTest();
+  const vHard = noteResponse({
+    requestedModeId: "8c46e95b1a07cecc",
+    result: {
+      frames: 0, unknownFrames: 0, controlFrames: 0, extCounts: {},
+      endedBy: "end", grpcStatus: "3",
+      error: "gRPC 状态 3: BardStatusException: Unsupported file source.",
+      texts: [],
+    },
+    hasAudioAttachment: false,
+  });
+  assert.notEqual(vHard.state, "transient", "参数类业务错误不得被当成可重试的 transient");
+  assert.equal(guardStatus().transients, 0, "非 transient 不得计入 transients");
+  ok("§22 (h3) 判定要窄：真业务错误（参数非法）不被当成 transient");
+}
+ok("★ 流结束标记 + 空闲宽限三态（根治自造空回复 / 确定性收尾）");
 
 console.log(`\n全部通过：${n} 组断言`);

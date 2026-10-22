@@ -127,6 +127,35 @@ export const config = {
   robinEmptyCapture: String(process.env.ROBIN_EMPTY_CAPTURE ?? "1") !== "0",
   robinEmptyCaptureBytes: Math.max(64, Number(process.env.ROBIN_EMPTY_CAPTURE_BYTES ?? 512)),
 
+  // ── 空闲/时限判定（2026-10-20 二次修订：等待上限拉到 300s）────────────
+  //   用户要求：**等待上限 300s**；只有「上游提前终止会话」或「真正的空响应」
+  //   才提前结束 —— 不再由我方的静默定时器把「上游慢」掐成空回复。
+  //
+  //   结束条件（先到先算，见 lib/robin.js）：
+  //     ① 正文完成标记 Lgapu.#19 == 2   → 立即收尾（确定性）
+  //     ② 上游 EOS 标记 ext1003{Lgcvc.#2 空} → 立即收尾（确定性）
+  //     ③ 上游会话终止（END_STREAM/trailers/close）→ 收尾
+  //     ④ 上游真空（一个字节都没回来）持续 robinIdleMs → 失败（真正的空响应）
+  //     ⑤ 总时限 robinTimeoutMs（≤300s）到 → 收尾（判为超时）
+  //     ⑥ 正文已开始但 ①②③ 都没来的兜底：静默超过 robinIdleAfterTextMs → 收尾
+  //
+  //   实测依据（2026-10-20）：
+  //     · 首正文延迟：轻请求 0.3~5.4s；生产载荷（6 视频+2 图+60KB 文本+Argon High）
+  //       10.8~30.1s（最大帧间隙 26.4s）⇒ 旧的统一 10s idle 必然误杀。
+  //     · Lgapu.#19：810 个正文帧**恒为单分片**；首个 #19=2 的帧即含全部文本
+  //       （139/141），其后 0 例再增长 ⇒ 可作确定性「正文已完整」信号。
+  //     · EOS 标记 136/141 出现；其余 5 例由 ① 覆盖。
+  //
+  //   ROBIN_TIMEOUT_MS        总时限（≤300s，与 Vercel maxDuration 对齐）
+  //   ROBIN_IDLE_MS           上游真空的快速失败宽限（frames==0）
+  //   ROBIN_IDLE_AFTER_TEXT_MS 正文已开始后的兜底静默宽限
+  //   ROBIN_IDLE_FIRST_MS     「首正文前」的等待上限（默认=总时限）
+  //                            ※ 调小可恢复「卡死即重试」的旧行为
+  robinTimeoutMs: Math.min(300_000, Math.max(10_000, Number(process.env.ROBIN_TIMEOUT_MS ?? 300_000))),
+  robinIdleMs: Math.max(1_000, Number(process.env.ROBIN_IDLE_MS ?? 10_000)),
+  robinIdleAfterTextMs: Math.max(1_000, Number(process.env.ROBIN_IDLE_AFTER_TEXT_MS ?? 30_000)),
+  robinIdleFirstMs: Math.min(300_000, Math.max(1_000, Number(process.env.ROBIN_IDLE_FIRST_MS ?? 300_000))),
+
   // ★ .env 路径（供 auth.js 在 /login 绑定成功后把新master token 落盘）。
   //   不落盘的代价：绑定只活在进程内存里，一重启就退回 .env 里的旧 token，
   //   而那个通常已失效 ⇒ 表现为「刚绑定成功、一重启又 auth-failure」。

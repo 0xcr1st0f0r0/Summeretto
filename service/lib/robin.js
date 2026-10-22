@@ -243,12 +243,37 @@ function isAuthFailure(r) {
   return r.status === 401 || r.status === 403;
 }
 
+/**
+ * ★ 空闲宽限的判定（纯函数，便于单测）。
+ *
+ * 三态（2026-10-20 二改，见 processQueryOnce 的 armIdle 注释）：
+ *   ① frames=0            → 短 idle（上游没接单，快速失败 = 真正的空响应）
+ *   ② frames>0 且无正文   → 长宽限 firstIdleMs（默认 = 总时限 300s）**耐心等**
+ *   ③ 已有正文            → 兜底宽限 idleAfterTextMs（正常路径由完成标记收尾）
+ *
+ * @param {{sawText:boolean, frames:number, idleMs:number, firstIdleMs:number, idleAfterTextMs?:number}} p
+ * @returns {number} 本次空闲定时器的毫秒数
+ */
+export function idleLimitFor({ sawText, frames, idleMs, firstIdleMs, idleAfterTextMs }) {
+  if (sawText) return idleAfterTextMs ?? idleMs;
+  if (frames > 0) return Math.max(idleMs, firstIdleMs);
+  return idleMs;
+}
+
 async function processQueryOnce({
   payload,
   frames,
   onFrame,
-  timeoutMs = 240_000,
-  idleMs = 10_000,
+  // ★ 2026-10-20 二改：总时限上限 300s（用户要求），且不再由静默定时器
+  //   提前掐断「上游慢」的请求 —— 结束只由上游终止 / 真空 / 完成标记驱动。
+  timeoutMs = config.robinTimeoutMs,
+  idleMs = config.robinIdleMs,
+  // ★ 首正文前的「空闲」宽限（默认 = 总时限 300s）：只在「上游一个字节都没回」
+  //   时才用短 idle；已受理（收到 ACK）就耐心等到总时限。
+  firstIdleMs = config.robinIdleFirstMs,
+  // ★ 正文已开始后的兜底静默宽限（正常路径由「正文完成标记 / EOS」收尾，
+  //   这里只兜底「上游既不给完成标记也不结束会话」的少数情况）。
+  idleAfterTextMs = config.robinIdleAfterTextMs,
   signal,
   headers: extraHeaders,
 } = {}) {
@@ -295,6 +320,18 @@ async function processQueryOnce({
       unknownFrames: 0,
       controlFrames: 0,
       extCounts: {},
+      // ★ 是否已产出正文（首个正文帧到达即置位）——armIdle 用它区分
+      //   「还没出正文（慢）」与「正文已结束（idle 收尾）」。
+      sawText: false,
+      // ★ 上游的「流结束」标记（ext1003{Lgcvc.#2 空}）是否收到
+      eos: false,
+      // ★ 「正文已完整」标记（Lgapu.#19 == 2）是否收到 —— 确定性收尾信号
+      complete: false,
+      // ★ 收到过「内容容器」帧（ext1003 带 Lfzrc）的次数 —— 空回复分流用：
+      //   >0 却没解出文本 ⇒ 我方解析问题；=0 ⇒ 上游根本没出正文。
+      contentFrames: 0,
+      // ★ 因空闲超时而在**正文出现前**被掐断（我方超时，非上游拒答）
+      idleCutBeforeText: false,
       // ★ 取证缓冲：仅 capture 开启时填充，空响应时由 degrade-guard 落盘
       rawFrames: null,
     };
@@ -319,13 +356,38 @@ async function processQueryOnce({
 
     const armIdle = () => {
       clearTimeout(idleTimer);
+      // ★★ 空闲判定**分三态**（2026-10-20 二改：等待上限 300s）
+      //
+      //   ① frames=0（一个字节都没回来）→ 短 idle（idleMs，默认 10s）
+      //      上游根本没接单（未受理 / 鉴权 / 真空）⇒ 快速失败，别浪费调用方预算。
+      //   ② frames>0 但**正文还没出** → 长宽限（firstIdleMs，默认 300s = 总时限）
+      //      ACK（ext1000）到达即说明 initial **已被受理**；此后的静默是
+      //      「模型在思考 / 在拉媒体」，不是拒答。**绝不能在这里掐流。**
+      //   ③ 正文已开始 → 兜底宽限（idleAfterTextMs，默认 30s）
+      //      正常路径由「正文完成标记（Lgapu.#19=2）」或「EOS 标记」**确定性**
+      //      收尾（见下方 data 处理），这里只兜底上游既不给完成标记也不结束
+      //      会话的少数情况。
+      //
+      //   为什么必须这样（实测证据，out/_ev-exp3/exp4 + _prod-payload-probe）：
+      //     · 同一载荷只改「正文前宽限」：统一 1.5s ⇒ 4/4 空回复；60s ⇒ 0/4。
+      //     · 生产载荷首正文 10.8~30.1s（最大帧间隙 26.4s）⇒ 统一 10s 必杀。
+      //     · 空回复时的帧序列与健康响应**完全同构**（1000/1003/1014）⇒ 旧的
+      //       分流逻辑把它误判成「文本落在未解明的数据包里」。
+      const limit = idleLimitFor({
+        sawText: result.sawText,
+        frames: result.frames,
+        idleMs,
+        firstIdleMs,
+        idleAfterTextMs,
+      });
       idleTimer = setTimeout(() => {
         result.endedBy ??= "idle"; // 数据静止 = 正常结束（长连接场景）
+        if (!result.sawText) result.idleCutBeforeText = true;
         try {
           stream.close();
         } catch {}
         done();
-      }, idleMs);
+      }, limit);
     };
 
     let stream;
@@ -374,6 +436,11 @@ async function processQueryOnce({
     });
 
     stream.on("data", (chunk) => {
+      // ★ 结算后不再累积（2026-10-20）：idle 定时器掐流时 done() 已 resolve，
+      //   但底层流可能还吐几帧。若继续累积，调用方读到的 result 会随时间变化
+      //   （同一请求有时读到"空"、有时读到"有内容"）⇒ 判定不确定。
+      //   结算即冻结：掐流那一刻看到什么，就是什么。
+      if (settled) return;
       armIdle();
       let chunkFrames;
       try {
@@ -404,6 +471,10 @@ async function processQueryOnce({
           const ex = extractResponse(parsed.body);
           result.texts.push(...ex.texts);
           result.ops.push(...ex.ops);
+          if (ex.texts.length || ex.cumulative) result.sawText = true;
+          if (ex.eos) result.eos = true;
+          if (ex.complete) result.complete = true;
+          if (ex.lfzrcSeen) result.contentFrames++;
           if (ex.ackCapabilities) result.ackCapabilities = ex.ackCapabilities;
           // 元信息（后到覆盖：末帧带完整值）
           for (const k of ["cumulative", "language", "conversationId", "responseId", "title", "model",
@@ -421,6 +492,22 @@ async function processQueryOnce({
           else if (parsed.kind === "control") result.controlFrames++;
           onFrame?.(parsed);
         }
+      }
+      // ★ 流结束标记（2026-10-20）：上游用 ext1003{Lgcvc.#2 空} 明确宣告「答完了」。
+      //   收到即**立即收尾** —— 不再等 idle 静默超时。
+      //   收益：① 每请求省掉一整段 idle 空等尾巴（旧实现固定多花 idleMs）
+      //        ② 收尾变成**确定性**的，不再依赖超时猜测 ⇒ 不会误截断答案，
+      //           也不会把「上游答完了」误判成「上游静默拒答」。
+      //
+      // ★★ 另一条确定性信号：**正文完成标记**（Lgapu.#19 == 2）
+      //   实测 141 个响应 810 帧：每帧恒为单分片；首个 #19=2 的帧即含全部文本
+      //   （139/141），其后 0 例再增长 ⇒ 见到即可收尾，不必等 EOS（EOS 只在
+      //   136/141 出现）。这让「首正文前的等待」可以放心拉到 300s：
+      //   因为**结束不再依赖静默超时**。
+      if (result.eos || result.complete) {
+        result.endedBy ??= result.eos ? "eos" : "complete";
+        try { stream.close(); } catch {}
+        done();
       }
     });
 
@@ -477,3 +564,4 @@ async function processQueryOnce({
     })();
   });
 }
+

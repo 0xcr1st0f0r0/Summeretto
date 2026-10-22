@@ -31,7 +31,10 @@ import crypto from "node:crypto";
 
 const TTL_MS = Math.max(0, Number(process.env.ROBIN_DEDUP_TTL_MS ?? 90_000));
 const MAX_ENTRIES = Math.max(1, Number(process.env.ROBIN_DEDUP_MAX ?? 64));
-const WAIT_MS = Math.max(0, Number(process.env.ROBIN_DEDUP_WAIT_MS ?? 120_000));
+// ★ 等待同键在途请求的时长（2026-10-20）：必须 ≥ 上游请求的等待上限（300s），
+//   否则调用方在长请求期间重发时会**等不到**在途结果 → 自行再打一次上游
+//   ⇒ 同一份内容计费两次（2026-10-17 那次重复计费事故的同类风险）。
+const WAIT_MS = Math.max(0, Number(process.env.ROBIN_DEDUP_WAIT_MS ?? 300_000));
 
 export function dedupEnabled() {
   return String(process.env.ROBIN_DEDUP ?? "1") !== "0" &&
@@ -134,22 +137,33 @@ export function lookupDedup(key) {
     return null;
   }
   if (e.err) return null; // 失败不重放：让本次真的去打，错误路径才可能恢复
-  if (!e.result || isEmptyResult(e.result)) return null; // 空结果不重放（见文件头设计边界）
+  if (!isCacheable(e.result)) return null; // 空结果/错误不重放（见文件头设计边界）
   stats.hits++;
   return { key, at: e.at, deltas: e.deltas.slice(), result: e.result };
 }
 
 /**
- * 判定「空响应」：与 empty-retry.js 同口径 —— 无正文、无 #30 回显、无错误。
- * 刻意不 import empty-retry（避免循环依赖），此处只需布尔判定。
+ * 该结果是否**可以**进入可重放缓存。
+ *
+ * ★ 设计边界（见文件头）：**空响应与错误都不得进缓存** ——
+ *   · 空响应必须继续走 empty-retry（「重试即好」是它的修复路径）；
+ *   · 错误必须继续透出让上层跨通道回退。
+ *   缓存它们会把「可恢复故障」固化成「假成功」。
+ *
+ * ⚠️ 2026-10-20 实测踩到的坑：旧实现把「有 error」判成「不算空」⇒
+ *   **错误结果被写进缓存**，随后 90 秒内**同一个 payload 的所有重试都被重放成
+ *   同一个错误**（实测：一次 20s 的取令牌超时 ⇒ 后续每次请求都直接回放
+ *   "no credential"，完全不再尝试恢复）。
+ *   ⇒ 有 error ⇒ 不可缓存（与空响应同等处理）。
  */
-function isEmptyResult(r) {
-  if (!r) return true;
-  if (r.error) return false; // 有错误走错误路径，不算空
+function isCacheable(r) {
+  if (!r) return false;
+  if (r.error) return false; // 错误不缓存（可恢复故障不得被固化）
   const texts = Array.isArray(r.texts) ? r.texts : [];
   const hasText = texts.some((t) => typeof t === "string" && t.trim().length > 0);
   const hasCumulative = typeof r.cumulative === "string" && r.cumulative.trim().length > 0;
-  return !hasText && !hasCumulative && !r.model;
+  if (!hasText && !hasCumulative && !r.model) return false; // 空响应不缓存
+  return true;
 }
 
 /**
@@ -164,10 +178,11 @@ export function completeDedup(lease, result, deltas = []) {
   e.result = result;
   e.deltas = deltas.slice();
   e.done = true;
-  if (!isEmptyResult(result)) {
+  if (isCacheable(result)) {
     stats.stores++;
   } else {
-    // 空/失败：立刻摘掉，避免占用窗口内的键位挡住后续合法重试
+    // 空响应 / 错误：立刻摘掉，避免占用窗口内的键位挡住后续合法重试，
+    // 也避免把可恢复故障固化成「假成功」（2026-10-20 实测踩坑）。
     entries.delete(lease);
   }
   wake(e);
