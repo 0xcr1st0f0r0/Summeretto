@@ -1,0 +1,18 @@
+# 构建上下文排除项（相对 service/ 目录）
+.git
+.gitignore
+node_modules
+out
+*.token
+.env
+.env.*
+*.log
+*.tmp
+
+# 非运行必需，排除以减小镜像与泄露面
+test
+tools
+docs
+README.md
+run-local.mjs
+vercel.json

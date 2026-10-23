@@ -1,0 +1,42 @@
+name: summeretto
+
+services:
+  summeretto:
+    build: .
+    image: summeretto:latest
+    container_name: summeretto
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      MAX_BODY_BYTES: 33554432
+      ROBIN_MEDIA_SHIM: "1"
+      ROBIN_ISOLATE_CONVERSATIONS: "1"
+      ROBIN_EMPTY_RETRY: 1
+      # 可选：下游调用密钥。留空则不校验调用方。
+      PROXY_API_KEY: ""
+      # 可选：凭证管理端点（/admin/gpsoauth、/admin/token）口令。
+      # 留空则 admin 端点禁用，/login 页面提示绑定端点已禁用。
+      ADMIN_KEY: ""
+      # 可选：谷歌账号凭证。留空则由 /login 网页绑定后写入卷内 .env。
+      GSA_EMAIL: ""
+      GSA_MASTER_TOKEN: ""
+      GSA_ANDROID_ID: ""
+      TOKEN_PROVIDER_URL: ""
+      # 凭证持久化开关，默认开启。
+      # 1：/login 将 master token 写入卷内 .env，启动时由 docker-entrypoint.sh 重新加载。
+      # 0：仅使用环境变量，绑定结果不落盘。
+      CREDENTIAL_PERSIST: "1"
+    # 持久化凭证存储，路径 /app/env/.env。
+    volumes:
+      - summeretto_env:/app/env
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  summeretto_env:
