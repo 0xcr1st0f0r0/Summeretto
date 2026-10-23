@@ -6,12 +6,12 @@
 
 # Summeretto
 
-### *「告别旧日调律，跃入蔚蓝狂想——知更鸟·晴歌在盛夏中唱响的、被解放的 gRPC 双向流。」*
+### *「告别官方繁琐限制，享受知更鸟小姐的高速流式拉条体验！」*
 
-**A high-performance summer gateway forged from Google's ancestral Robin protocol.**  
-**Bask in Miss Robin's liberated rhapsody: 100% action advance, zero deps, and boundless skies.**
+**A high-performance Gemini reverse gateway powered by Google's internal Robin protocol.**  
+**Zero dependencies, instant action advance, full model tiers, and built-in production guards.**
 
-*基于 Google 祖传 Robin 协议魔改的高性能夏日网关 —— 尽享知更鸟小姐（Robin • Summeretto）的专属高速拉条晴歌。*
+*基于 Google 内部 Robin 协议魔改的高性能 Gemini 网关 —— 纯手写零依赖，享受知更鸟·晴歌（Robin • Summeretto）专属的全速推流体验。*
 
 <br>
 
@@ -25,79 +25,76 @@
 
 ---
 
-## ◆ Prologue · 序章：从金色牢笼到蔚蓝狂想
+## 📖 Introduction · 项目简介
 
-<br>
+### 这是什么？
+**Summeretto** 是一个专为 Google Gemini 打造的高性能逆向代理网关。它把 Google Gemini 移动端 App 底层使用的 **Robin gRPC 双向流协议**（基于 HTTP/2 + Protobuf），转换为标准兼容的 **Gemini REST API**（例如标准的 `/v1beta/models/{model}:generateContent` 和流式输出）。
 
-**In the beginning, there was only the sealed garden — the Gemini App, radiant as Penacony's golden dream, yet locking its full power behind proprietary protobuf and rigid tunings. The seekers were given only a servant's door: a metered key, a throttled purse, and a cold REST endpoint constrained by the platforms' 4.5 MB inbound ceiling.**
+你的本地客户端或前端应用（如 NextChat、LobeChat、自建 Agent 等）只需要像调用官方 Gemini API 一样发送标准 JSON 请求，Summeretto 就会在后台通过高速 gRPC 双向流与上游交互，并将生成结果实时推流回给客户端。
 
-**In the grand opera of the cosmos, Robin was once expected to sing only inside the Family's gilded birdcage. But when the illusions of the Charmony Festival shattered, she shed the heavy gala dress, stepped onto the star-faring train, and arrived at the sun-drenched shores of Thousand Stars City. Reborn as 「Robin • Summeretto」 (知更鸟·晴歌), walking the Path of Remembrance, she no longer sings for scripted harmony — she sings for the boundless sky, summoning her memo-spirits to improvise life's truest melody.**
+### 为什么叫 Summeretto？
+在《崩坏：星穹铁道》中，人气角色知更鸟褪去匹诺康尼的繁重礼服，化身轻松自由的**「知更鸟·晴歌」（Robin • Summeretto）**，带着三只可爱的忆灵小鸟奔向蔚蓝海滩，开启充满活力的夏日变奏；而在技术世界里，Google 内部专门负责 Gemini 移动端高速推流的底层协议代号恰好也叫 **Robin**。
 
-<br>
-
-> *起初，只有一座封闭的庭园 —— Gemini App，璀璨如匹诺康尼的金色美梦，却将真正的模型伟力深锁在私有 protobuf 与严苛调律的高墙之后。求索者只被赐予一扇下人的偏门：一把限速的钥匙、一只计量的钱袋，以及动辄被云平台 4.5MB 入站硬壁垒斩断的冰冷 REST 接口。*
->
-> *在星海的宏大剧目中，知更鸟曾被期望永远留在家族的金色鸟笼里献唱赞美诗。然而，当谐乐大典的虚幻泡沫破碎、秩序的阴霾散去，她褪去繁重的华服，登上星穹列车，来到了千星城的阳光沙滩。化身「知更鸟·晴歌」（Robin • Summeretto），踏上「记忆」的命途——她不再为人偶般的调律歌唱，而是迎着风浪与晴空，唤起属于自己的忆灵，奏响自由的变奏。*
-
-<br>
-
-**Summeretto is that liberated summer passage. It speaks the standard Gemini format to your local clients, while whispering Robin's ancestral gRPC bidirectional stream protocol directly to the upstream. With the memo-spirits Bessie, Chumi, and Paddin joining the stage, Summeretto triggers the 【Fever】 state: 100% action advance, zero external dependencies, unthrottled inference, and not a single byte of music severed in mid-air.**
-
-<br>
-
-> *Summeretto 便是那条被解放的夏日航道。它对本地客户端说标准 Gemini 语言，对上游则低语 Robin 的祖传 gRPC 双向流协议。伴随着忆灵贝茜、啾米与派丁的相继登台，Summeretto 瞬间引爆【Fever】狂热状态：全速 100% 极限拉条、零外部依赖、无视上游苛刻防御、不让半拍歌声在中道被无情掐断。*
+本项目以此为灵感命名，旨在打破官方公有 API 的种种繁琐限制，像知更鸟在游戏中为全队“100% 极限拉条”一样，让你的 AI 交互享受零排队、满血档位、毫秒级首字响应的极速体验！
 
 ---
 
-## ✦ The Arsenal · 武备库：忆灵协奏与行迹
+## ✨ Key Features · 核心特性
 
-<br>
+Summeretto 不仅是一个转发器，还内置了大量针对官方私有协议深水区难题的生产级解决方案：
 
-| Arsenal · 武备 | In-Game Archetype · 命途与行迹 | Description · 描述 |
+| 特性 | 机制别名 | 技术实现与解决的痛点 |
 |---|---|---|
-| **🪶 Zero Dependencies**<br>零依赖 | **秘技：我们自成旋律**<br>*We Form Our Own Melody* | Pure Node.js 22 standard library. Not a single `npm install`. Hand-rolled wire codec and HTTP/2 framing. Lightweight, self-contained, soaring unburdened.<br>纯 Node.js 22 标准库。一条 `npm install` 都不需要。手写编解码与 HTTP/2 帧，不借外力，自成旋律。 |
-| **⚡ gRPC Bidi Core**<br>双向流核心 | **天赋：巡游无界天空**<br>*Cruise the Boundless Sky* | Native bidirectional HTTP/2 stream over `node:http2`. Pours inference responses down with lightning speed; enters the 【Fever】 state where network friction disappears.<br>基于 `node:http2` 原生双向推流。全速拉条，瞬时推流，如入【Fever】狂热之境，网络摩擦荡然无存。 |
-| **🎭 Mode Awakening**<br>档位觉醒 | **忆灵登台 · 实时发现**<br>*Live Tier Awakening* | Real upstream model tiers via `Lgauy.#16`, discovered live from `GetUserStatus` — no hardcoded illusions. Argon, Pro, Flash, and Flash-Lite dynamically indexed.<br>走 `Lgauy.#16` 从 `GetUserStatus` 实时发现真实模型档位——绝非硬编码占位符。四档（Argon、Pro、Flash、Flash-Lite）动态编排。 |
-| **🧠 Thinking Intensity**<br>思考强度 | **深海心绪 · 灵动变奏**<br>*Deep Thought Variations* | `Lfzqy.#48` — Low (`1`) / Medium (`4`) / High (`2`), orthogonal to model tier (⚠️ non-sequential enum). Ask for deep thought without changing singers.<br>`Lfzqy.#48`——低（`1`）/ 中（`4`）/ 高（`2`）三档调节，与模型档位正交（⚠️ 协议非连续枚举）。要求深思，而不必更换歌者。 |
-| **🎵 Media Shim**<br>媒体渡桥 | **行迹：偏离和弦**<br>*Deviated Chord* | Upstream audio and Argon tier are mutually exclusive? Wrap audio inside a 16×16 placeholder video and slip through the video portal. Downsampled to 0.25 fps — visual tokens −75%, total media billing −66.7%.<br>上游音频与 Argon 互斥？将音频转封装进 16×16 极小占位视频，巧妙越过视频门扉。降采样至 0.25 fps——视觉 token −75%，媒体总成本直降 66.7%。 |
-| **🎺 Empty-Response Retry**<br>空响应自愈 | **行迹：即兴蓝调**<br>*Impromptu Blues* | Transient empty response from upstream? Distinct from account-level downgrades: automatically retries within a tight budget guard (~100s budget, 60s reserve) to preserve Robin's golden timbre.<br>遭遇上游偶发空响应？严格区分账号级换将与偶发真空：在严密时间预算护栏内即兴重试自愈，全力留住知更鸟的黄金品质。 |
-| **🛡️ Idempotent Dedup**<br>幂等去重 | **「使一颗心免于哀伤」**<br>*Stop a Heart From Breaking* | "Client didn't receive" ≠ "Upstream didn't bill." Identical payloads in a 90s window are replayed with **zero** upstream calls, protecting every single token.<br>「客户端没收到」≠「上游没算」。90 秒滑动窗口内逐字节相同的请求直接重放，**零**上游调用，免去重复计费的哀伤。 |
-| **🌙 Graceful Shutdown**<br>优雅停机 | **守护在途歌者**<br>*Protect the In-Flight Singer* | SIGTERM never decapitates an in-flight query. New callers receive 503; the ones already mid-song are guarded until their final cadence falls silent.<br>SIGTERM 绝不再斩断在途请求。新请求温和拒斥（503），而正在唱响的歌者会被温柔护送至终曲。 |
-| **🔭 Degrade Observatory**<br>降级观测台 | **澄澈目光 · 不擅换将**<br>*Unyielding Observatory* | Observe-only. Silent upstream downgrades are mirrored verbatim; fallback decisions belong to orchestrators (e.g. Eidolon). Robin never alters her cast without consent.<br>只忠实观测，绝不擅自越权。静默降级原样透出，跨通道回退交由上层调度。知更鸟绝不擅自换将。 |
-| **📜 Quota Metering**<br>配额度量 | **诚实纪元 · 算力估算**<br>*Honest Quota Accounting* | Local token estimation (explicitly tagged non-billable) deployed after wire archaeology proved the upstream returns zero usage telemetry.<br>逆向证实上游绝不回传 token 后，于本地进行严谨估算（明确标注文档不可计费），对算力保持清醒与诚实。 |
+| **🪶 纯零依赖**<br>Zero Dependencies | **「我们自成旋律」** | 纯 Node.js 22 标准库手写，**完全不需要执行 `npm install`**。没有体积庞大的第三方库，也不依赖 Protobuf 编译器生成的冗长代码，整台引擎代码轻巧清晰，随时可读。 |
+| **⚡ 原生 gRPC 双向流**<br>gRPC Bidi Core | **「巡游无界天空」** | 基于 `node:http2` 手写帧封装与流式双向传输。告别传统 HTTP 轮询与单向推流，首字延迟极低，体验真正的流式全速拉条。 |
+| **🎭 真实模型档位实时发现**<br>Mode Awakening | **「档位觉醒」** | 真实模型档位通过 `Lgauy.#16` 从上游 `GetUserStatus` 接口实时动态发现，绝非自欺欺人的占位符。动态支持 **4 Argon**、**3.1 Pro**、**3.8 Flash** 和 **3.5 Flash-Lite**。 |
+| **🧠 思考强度独立调节**<br>Thinking Intensity | **「灵动变奏」** | 协议底层支持 `Lfzqy.#48` 独立调节思考时间（枚举值 `1=Low / 4=Medium / 2=High`）。与模型名称完全正交，无需切换模型名字即可按需开启深度思考。 |
+| **🎵 音频转视频破除互斥**<br>Media Shim | **「偏离和弦」** | **彻底解决官方致命缺陷**：上游 Robin 协议中，原生音频附件与满血 Argon 档位互斥（带音频就会被强降级）。Summeretto 自动用 ffmpeg 把音频包进 16×16 黑帧视频走视频通道（降采样至 0.25fps），视觉 token 省 75%，总媒体账单降低 66.7%，满血 Argon 听写与深度推理兼得！ |
+| **🎺 空响应自动重试自愈**<br>Empty-Response Retry | **「即兴蓝调」** | 针对官方 App 也会偶发的“返回 HTTP 200 STOP 但内容全空”问题，Summeretto 智能甄别“偶发断流”与“账号级降级”，在 100s 预算护栏内自动原地重试，对调用方完全透明无感。 |
+| **🛡️ 90秒幂等去重防扣费**<br>Idempotent Dedup | **「免于重复计费」** | 客户端断网后自动重试？Summeretto 在 90 秒滑动窗口内对完全一致的请求直接重放缓存，**0 上游重复调用**，坚决防止同一段大视频/提示词被上游重复计费。 |
+| **🌙 优雅停机保护在途请求**<br>Graceful Shutdown | **「守护在途歌者」** | 收到 SIGTERM 停机信号时，不再粗暴杀死进程。新请求温和返回 503，正在跑的请求温柔守候直至推理完整结束，避免重启造成“上游已扣费但客户端没收到”的损失。 |
+| **🔭 静默降级透明观测**<br>Degrade Observatory | **「降级观测台」** | 上游若因账号配额不足将高档位静默降为 Flash-Lite，Summeretto 只忠实原样透出响应元数据（`modelVersion`），绝不自作主张擅自换将，将降级切换权交由上层调度器。 |
+| **📜 本地 Token 诚实估算**<br>Quota Metering | **「算力度量」** | 逆向证实上游私有协议绝不返回 token 使用量。Summeretto 在本地按官方公开标准严格估算（明确标注文档非计费依据），让你对调用开销保持清醒。 |
 
 ---
 
-## ⚡ Quick Start · 快速启动
+## 🚀 Quick Start · 快速上手
 
-<br>
-
-**Clone, configure, sing.**
+### 1. 克隆与配置
 
 ```bash
+# 克隆仓库
 git clone https://github.com/0xcr1st0f0r0/Summeretto.git
 cd Summeretto/service
-cp .env.example .env      # then fill in GSA_EMAIL / GSA_MASTER_TOKEN
+
+# 准备环境变量文件
+cp .env.example .env
+```
+
+### 2. 网页一键登录获取凭据
+
+你不需要准备真实安卓手机、不需要装 Frida 抓包，也不需要 Root 设备！
+
+启动服务：
+```bash
 node server.mjs
 ```
 
-*克隆、配置、开唱。*
+然后直接在浏览器中打开：
+```
+http://127.0.0.1:3000/login
+```
+按照内置的简洁网页引导完成一次 Google 账号授权，系统会自动帮你铸造出长效的 `GSA_MASTER_TOKEN` 并自动回写落盘到 `.env` 中。后续服务端会自动管理和刷新短期访问令牌。
 
-<br>
+### 3. 验证服务状态
 
-**Open `http://127.0.0.1:3000/login` to let the embedded web flow mint your master token — no physical device, no ADB, no root.**
-
-*打开 `http://127.0.0.1:3000/login`，让内置网页流程为你铸出 master token——无需真机、无需 ADB、无需 root。*
-
-<br>
-
-**Verify the gate is truly open and the stage is set:**
+使用 `curl` 检查服务是否就绪：
 
 ```bash
 curl -s http://127.0.0.1:3000/healthz | python3 -m json.tool
 ```
 
-*验证门扉是否敞开、舞台是否就绪：*
+如果一切正常，你会收到类似如下的 JSON 应答：
 
 ```json
 {
@@ -110,322 +107,204 @@ curl -s http://127.0.0.1:3000/healthz | python3 -m json.tool
 }
 ```
 
-> ⚠️ `credential.verdict` is **passive** — it never pings Google. `auth: "configured"` alone is a liar; trust only the verdict.
->
-> ⚠️ `credential.verdict` 是**纯被动**判定，绝不为此无谓打扰 Google。单看 `auth: "configured"` 会说谎，只信 verdict。
+> 💡 **提示**：`credential.verdict` 是纯被动状态判定，绝不会无谓请求 Google 服务器。只要显示 `"usable": true`，就代表凭证完全可用。
 
 ---
 
-## ◆ The Three-Step Incantation & Memo-Spirits · 三步咏唱与忆灵降临
+## 🛠️ How It Works · 协议原理解密
 
-<br>
+### 为什么一次请求需要“发三步”？
 
-**One logical query is not a mere HTTP request. It is a three-part symphony — mirroring the three memo-spirits of Robin • Summeretto:**
-
-```
-[战技：乐手起音]      Initial Frame  ──►  粉鸟·贝茜 (Bessie)   ─── 建立双向流信道与元数据
-[气氛积聚：预取]      Prefetch Frame ──►  啾米 (Chumi)         ─── 挂载附件、展开嵌套信封
-[全员集结：引爆]      Commit Frame   ──►  派丁 (Paddin)        ─── 单帧 Lgcvl{#2} 落地，瞬间触发【Fever】！
-```
-
-*一次逻辑查询不是一发孤立的 HTTP 请求。它是一场三位一体的协奏——恰如知更鸟·晴歌的三位忆灵伙伴：*
-
-<br>
-
-**The commit frame must be a single, surgical `Lgcvl{#2}`. The request envelope itself is `Lgcvp` bare, zero-wrapped. Anything else (`Lgcxj`) is an imitation that invites upstream rate limits.**
-
-*提交（commit）必须是极其利落的单帧 `Lgcvl{#2}`。外层请求信封为 `Lgcvp` 裸格式，零层多余包装。换成其它（如 `Lgcxj`）皆是劣化仿品，只会招致上游限流。*
-
-<br>
-
-**The attachment chain cascades through three nested envelopes:**
+在常规 REST API 中，发一次请求就是发一个 HTTP POST。但在 Google Robin 双向流协议中，一次完整的查询是一套严密的**三步仪式**，恰好对应知更鸟的三位忆灵伙伴：
 
 ```
-Lgcvp[ext1000] → Lgcvm[ext1001] → Lgcvb.#1 → Lfzqy{#1 Lgbkn, #13 Lgauy}
+[步骤一：通道就绪]   Initial Frame  ──►  粉鸟·贝茜 (Bessie)   ─── 建立双向流信道，发送首帧、文本提示与附件引用
+[步骤二：上下文预取] Prefetch Frame ──►  啾米 (Chumi)         ─── 挂载预取元数据、展开嵌套信封
+[步骤三：正式提交]   Commit Frame   ──►  派丁 (Paddin)        ─── 落地单帧 Lgcvl{#2}，三鸟齐聚，瞬间开始推流！
 ```
 
-*附件链路逐层穿过三重嵌套信封：*
+* **关键约束**：第三步提交（Commit）必须是极其利落的单帧 `Lgcvl{#2}`。最外层请求信封为 `Lgcvp` 裸格式，零层多余包装；若错包成旧客户端的 `Lgcxj`，会直接触发上游的严苛限流。
+* **附件信封嵌套链路**：
+  ```text
+  Lgcvp[ext1000] → Lgcvm[ext1001] → Lgcvb.#1 → Lfzqy{#1 Lgbkn, #13 Lgauy}
+  ```
 
-<br>
+### 承载位铁律（Carrier Law）
 
-**The model tier adheres to the Carrier Law, uncovered through days of painstaking wire reverse-engineering:**
+为什么有时候请求了满血 Argon，模型却变笨了？这是因为上游对 Protobuf 字段的位置有严苛要求：
 
-| Condition · 条件 | Carrier · 承载位 | Result · 结果 |
+| 场景条件 | 档位承载位置 | 实际生效结果 |
 |---|---|---|
-| Envelope present, no raw audio (text / images / media shim video) | `Lgcvm.#1` | Mode takes effect at full throttle (`Lfzqy.#13` present as envelope anchor) |
-| 有信封，无原始音频（纯文本 / 图片 / 占位视频转封装） | `Lgcvm.#1` | 档位生效，满血推流（`Lfzqy.#13` 随附作为信封锚点） |
-| Envelope present, raw audio attached (unshimmed fallback) | `Lfzqy.#13` | Mode yields to hearing (Argon cannot natively parse audio; drops to Flash-Lite) |
-| 有信封，带原始音频（未走转封装之回退） | `Lfzqy.#13` | 档位退让换听觉（Argon 原生无法解析音频，自动走 Flash-Lite） |
-| No envelope (pure text, no attachments, default thinking) | `Lgcvm.#1` | Mode applies directly via `Lgcvm.#1 Lgauy.#16` (zero envelope overhead) |
-| 无信封（纯文本、无附件、默认思考档位） | `Lgcvm.#1` | 档位直接由 `Lgcvm.#1 Lgauy.#16` 承载，零信封开销生效 |
+| **无原始音频**（纯文本 / 图片 / 走占位视频转封装） | `Lgcvm.#1` | **满血 Argon 生效**，推流全开（信封内随附 `Lfzqy.#13` 维持结构） |
+| **携带原始音频**（未走转封装之回退） | `Lfzqy.#13` | **档位自动退让换听觉**（Argon 原生无法解析音频，自动回落 Flash-Lite） |
+| **纯文本无信封**（无附件、默认思考档位） | `Lgcvm.#1` | **直接由 `Lgcvm.#1 Lgauy.#16` 承载**，零多余信封开销生效 |
 
 ---
 
-## ✦ Model Tiers · 模型档位
+## 🎭 Model Tiers · 模型档位清单
 
-<br>
+Summeretto 内部每 10 分钟自动与上游同步一次真实档位表：
 
-| Tier · 档位 | Mode ID (Upstream Hex) | Rank · 阶 | Specialization · 专长 |
+| 模型档位 (Tier) | 上游真实 Mode ID (Hex) | 阶级 (Rank) | 推荐使用场景 |
 |---|---|---|---|
-| **4 Argon** | `95a4c0abcba24364` | 8 | Flagship deep reasoning & ultimate synthesis · 满血旗舰深思与终极合成 |
-| **3.1 Pro** | `e6fa609c3fa255c0` | 3 | Balanced complex logic & heavy multi-turn · 均衡复杂长文本推理 |
-| **3.8 Flash** | `56fdd199312815e2` | 1 | High-speed low-latency stream-song · 高速低延时拉条首选 |
-| **3.5 Flash-Lite** | `8c46e95b1a07cecc` | 6 | Lightweight fallback baseline · 轻量降级兜底基线 |
-
-*These mode IDs are served live by the upstream orchestrator, not manufactured. Summeretto refreshes the tier registry every 10 minutes.*
-
-*上述 ID 均由上游调度实时下发，绝非凭空臆造。Summeretto 每 10 分钟自动巡检刷新档位表。*
+| **4 Argon** | `95a4c0abcba24364` | 8 | 满血旗舰深思与终极复杂逻辑合成（主力旗舰） |
+| **3.1 Pro** | `e6fa609c3fa255c0` | 3 | 复杂多轮长文本推理与专业分析 |
+| **3.8 Flash** | `56fdd199312815e2` | 1 | 日常高频对话、低延迟快速响应（首选高敏捷档） |
+| **3.5 Flash-Lite** | `8c46e95b1a07cecc` | 6 | 超轻量级兜底基线（也是音频未转封装时的听觉退让档） |
 
 ---
 
-## ⚠️ Field Laws · 字段铁律
+## ⚠️ Protocol Pitfalls · 协议避坑指南
 
-<br>
+以下 5 条铁律是逆向分析过程中用大量调试时间换来的血泪经验：
 
-**Every single law was forged from sleepless nights of protocol archaeology. Read them before you touch the wire:**
-
-*以下每一条铁律，都是从逆向协议的深渊中用无数个深夜换来的。动线之前必读：*
-
-<br>
-
-**1. Field aliasing is mandatory.** Production SDK environments serialize `mime_type`; older clients send `mimeType`. Summeretto recognizes both unconditionally.  
-*1. 字段双认是铁律。* 生产 venv 序列化为 `mime_type`，旧版客户端则发 `mimeType`。二者必须无条件兼容。
-
-<br>
-
-**2. Tolerant parsing is mandatory.** `text` and `inlineData` can coexist in the same part. Writing an `else-if` will silently drop binary attachments.  
-*2. 宽容解析是铁律。* `text` 与 `inlineData` 常同处于一个 part。写成 `else-if` 会在神不知鬼不觉中丢弃附件。
-
-<br>
-
-**3. HTTP/2 unary completes at trailers.** Wait for trailers, or you will burn 10–15 seconds in meaningless timeouts.  
-*3. HTTP/2 unary 收到 trailers 方为大成。* 不等 trailers 就会在虚无中空耗 10~15 秒。
-
-<br>
-
-**4. Conversation isolation is on by default.** The upstream maintains stateful memory **per account**. Without explicit teardown, different clients will bleed their history into one another.  
-*4. 会话隔离默认开启。* 上游按**账号维度**维持有状态上下文；若不进行显式会话隔离清理，不同调用方的上下文记忆将相互渗透。
-
-<br>
-
-**5. `#16` strictly obeys the carrier law.** Misplace it by a single level and the upstream silently casts your request into the void. Guarded by unit §14.11 and e2e §3b.  
-*5. `#16` 必须死守承载位法则。* 错置哪怕一个层级，上游都会将其静默忽略。单测 §14.11 与 e2e §3b 对此布下严密重兵。
+1. **字段名大小写双重兼容**：不同版本的客户端/SDK 序列化规则不一（有的发 `mime_type`，旧版发 `mimeType`）。网关必须双向宽容认领，缺一不可。
+2. **文本与附件宽容并存**：在 Gemini 请求体中，`text` 与 `inlineData` 经常出现在同一个 part 对象里。切勿写成 `else-if`，否则会静默丢弃用户的附件。
+3. **HTTP/2 Unary 请求必须等 Trailers**：如果不等待 trailers 帧到达就判定完成，客户端会白白空等 10～15 秒直至超时。
+4. **会话隔离必须默认开启**：Robin 服务端会按**账号维度**维持连续会话。若不执行显式会话隔离清理，不同调用方的上下文历史会互相串扰污染。
+5. **模型 ID 承载位不可放错**：模型 ID 放错嵌套层级会被上游完全无视，导致请求静默回落到最低兜底档位。
 
 ---
 
-## 🛡️ The Duplicate-Billing Incident · 重复计费事故
+## 🛡️ The Story · 一次由重启引发的重复计费惨案
 
-<br>
+### 「客户端没收到」≠「上游没扣费」
 
-### *「如果我能使一颗心免于哀伤，我就没有虚度此生。」*
-
-**This is the incident Summeretto was built to eradicate. Inscribed here so that no engineer walks into this trap again.**
-
-*这是 Summeretto 被锻造出来的原点。铭刻于此，愿星海中的漫游者不再重蹈覆辙。*
-
-<br>
-
-**On a summer evening, a complex multimodal inference succeeded. A gateway process was restarted to deploy a routine health check. That restart severed an in-flight request whose attachments had already been staged, whose tokens had already been minted, and whose inference was already racing upstream. Seeing `Server disconnected`, the client SDK dutifully re-sent the exact same payload.**
-
-**The upstream billed it twice. The exact same 317 KB video and its 29.9k-token prompt were debited in full — twice — and the first song was sung to an empty void.**
-
-<br>
-
-> *某个盛夏的傍晚，一次复杂的多模态推理刚刚展开。网关因热更新健康检查而执行了重启。那一记重启，斩断了一个在途请求——它的音视频附件已就绪、令牌已铸造、上游算力已全速开跑。调用方的 SDK 骤见 `Server disconnected`，便忠实地重发了逐字节完全相同的请求包。*
+在 Summeretto 早期开发的一个傍晚，发生过一次真实的事故：
+> 当时正在进行一次包含 317KB 视频附件与 29.9k token 提示词的复杂多模态推理。运维人员因热更新健康检查脚本执行了网关重启。这一重启直接掐断了连接。调用方 SDK 检测到 `Server disconnected` 后，忠实地重新发送了完全一致的请求包。
 >
-> *上游毫不留情地计了两次费。那段 317KB 的视频连同其 29.9k token 的提示词，被足额扣除了两遍——而其中一首壮丽的晴歌，坠入了无人接收的深渊。*
+> **结果**：上游针对前后两个请求全额扣了两次配额与费用——而第一次推理生成的回答，因为连接已被掐断，永远沉入了虚空。
 
-<br>
-
-**Three inviolable laws were written in response:**
+为了杜绝此类惨剧，Summeretto 确立了三条刚性工程法则，并转化为机械代码执行：
 
 ```text
-1. "Client didn't receive" ≠ "Upstream didn't bill."
-   客户端没收到，绝不等于上游没计费。
-
-2. Severing a connection severs the return path only.
-   掐断连接，掐断的仅仅是回程的耳朵，算力的巨轮依然在狂奔。
-
-3. Before restarting, check /healthz → inflight. If > 0, wait for the song to finish.
-   任何重启之前，必先检视 /healthz → inflight。只要大于 0，便静候终曲。
+1. 客户端没收到，绝不代表上游没扣费！
+2. 掐断网络连接，只是断了接收的耳朵，上游算力的齿轮依然在转动。
+3. 任何重启操作之前，必须检查 /healthz 中的 inflight 计数；只要大于 0，必须等待歌者唱完。
 ```
 
-<br>
-
-**These laws are now mechanically guarded:**  
-- `lib/dedup.js` captures identical payloads in a 90s window and replays the cached stream with **zero upstream calls**.  
-- `lib/inflight.js` intercepts SIGTERM, politely rejecting new callers with 503 while letting every in-flight singer finish her song in peace.
-
-*如今，这些法则已化作不可动摇的机械防线：*  
-- `lib/dedup.js` 在 90 秒窗口内捕获相同载荷，以**零上游调用**完整重放；  
-- `lib/inflight.js` 接管 SIGTERM 停机信号，向新请求返回 503，同时温柔守护每一个正在歌唱的在途请求平稳落幕。
+* **防线一**：`lib/dedup.js` —— 90 秒滑动窗口内逐字节对比，若发现重复请求直接重放上次缓存流，**零上游调用**。
+* **防线二**：`lib/inflight.js` —— 拦截系统 SIGTERM 信号，拒绝新连接，等待在途请求平稳落幕。
 
 ---
 
-## ◆ Testing · 试炼
+## 🧪 Testing · 离线全套测试
 
-<br>
+项目配备了完善的测试套件，**100% 离线自洽运行**，无需花费任何真实配额：
 
 ```bash
 cd service
-node test/run.mjs    # 83 unit assertions · 83 组单元断言
-node test/e2e.mjs    # 49 e2e assertions · 49 组端到端断言
+node test/run.mjs    # 运行单元测试（83 组断言通过）
+node test/e2e.mjs    # 运行端到端集成测试（49 组断言通过）
 ```
 
-**Both suites are 100% offline.** The mock Robin speaks native h2c, and the mock upstream lives at `127.0.0.2`. You can test full media shimming, empty-retry guards, deduplication, and streaming without consuming a single cent of quota or byte of public bandwidth.
-
-*两套测试套件 100% 离线自洽。mock Robin 操持原生 h2c，mock 上游栖息于 `127.0.0.2`。无论是占位视频渡桥、空响应自愈、幂等去重还是流式推流，无需消耗一分钱额度、无需耗费一丝外网流量。*
+测试内置了基于 `127.0.0.2` 的 h2c mock Robin 服务，无论是占位视频转换、空响应重试、幂等去重还是流式传输，都能在本地以秒级速度完成无损回归验证。
 
 ---
 
-## ✦ Repository Map · 疆域图
+## 🗺️ Repository Map · 目录导览
 
-<br>
-
-```
+```text
 Summeretto/
-├── service/                   ← The Engine · 核心引擎本体（0 外部依赖）
+├── service/                   ← 核心代理引擎（纯标准库，0 npm 外部依赖）
 │   ├── lib/
-│   │   ├── wire.js            protobuf wire codec · 手写线格式编解码器
-│   │   ├── robin.js           gRPC bidi driver · 原生 HTTP/2 双向流驱动
-│   │   ├── pq.js              three-step query script · 三步咏唱与忆灵调度
-│   │   ├── gemini.js          Gemini ⇄ Robin translation · 原生格式翻译桥
-│   │   ├── auth.js            master-token minting · 令牌铸造与验真
-│   │   ├── gpsoauth.js        GPSOAuth protocol · 谷歌移动鉴权实现
-│   │   ├── login-page.js      embedded web login portal · 内置免设备登录页
-│   │   ├── modes.js           model tiers + thinking · 档位编排与思考强度
-│   │   ├── mediashim.js       audio→16x16 video shim · 「偏离和弦」渡桥 (0.25fps)
-│   │   ├── empty-retry.js     empty-response auto-retry · 「即兴蓝调」自愈
-│   │   ├── dedup.js           idempotent replay · 90s 幂等去重
-│   │   ├── inflight.js        in-flight counter · 在途计数与优雅停机
-│   │   ├── degrade-guard.js   observe-only downgrade watch · 澄澈降级观测
-│   │   ├── usage-estimate.js  local token estimation · 算力估算
-│   │   ├── toolcall.js        function calling emulation · 工具调用仿真
-│   │   ├── upload.js          push.clients6 upload · 分片断点上传管道
-│   │   ├── config.js          environment & defaults · 运行时配置与护栏
-│   │   └── app.js             HTTP gateway + endpoints · 服务路由与入口
-│   ├── test/                  ← 83 + 49 offline assertions · 离线全胜断言
-│   └── server.mjs             ← entry + graceful shutdown · 优雅启动与退出
-├── docs/                      ← protocol archaeology reports · 协议考古秘卷
-└── tools/                     ← device-side extraction utilities · 抓包与逆向工具
+│   │   ├── wire.js            Protobuf 线格式编解码器
+│   │   ├── robin.js           HTTP/2 gRPC 双向流网络驱动
+│   │   ├── pq.js              ProcessQuery 协议三步组装与解析
+│   │   ├── gemini.js          Gemini REST 格式与 Robin 格式双向翻译
+│   │   ├── auth.js            Token 状态维护与被动验真
+│   │   ├── gpsoauth.js        Google Play Services OAuth 协议实现
+│   │   ├── login-page.js      内置 Web 免设备登录交互界面
+│   │   ├── modes.js           模型档位与思考强度管理
+│   │   ├── mediashim.js       音频转 16x16 极小视频渡桥模块 (0.25fps)
+│   │   ├── empty-retry.js     空响应智能重试与时间预算护栏
+│   │   ├── dedup.js           90 秒幂等去重重放层
+│   │   ├── inflight.js        在途请求跟踪与优雅停机调度
+│   │   ├── degrade-guard.js   上游静默降级透明观测器
+│   │   ├── usage-estimate.js  本地 Token 算力估算器
+│   │   ├── toolcall.js        工具调用 (Function Calling) 仿真注入
+│   │   ├── upload.js          push.clients6 分片断点上传管道
+│   │   ├── config.js          环境变量与运行时配置中心
+│   │   └── app.js             HTTP 路由分发与服务主逻辑
+│   ├── test/                  ← 83 + 49 组离线全量断言测试
+│   └── server.mjs             ← 服务启动入口与信号接管
+├── docs/                      ← 协议考古与实测逆向分析报告
+└── tools/                     ← 设备侧抓包与分析辅助脚本
 ```
 
 ---
 
-## ⚡ Deployment · 布阵：自托管的无界天空
+## 🚢 Deployment · 生产部署建议
 
-<br>
+### 为什么强烈建议自建 VPS 而非 Serverless 平台？
 
-**Self-hosted VPS is the only blessed path.** Serverless platforms like Vercel impose an insurmountable 4.5 MB inbound ceiling that turns rich audio and multimodal prompts into an immediate `413 Payload Too Large`. Summeretto was forged to break free from that ceiling and fly into the boundless sky.
+像 Vercel 等 Serverless 平台普遍存在 **4.5 MB 的请求体硬上限**。在多轮多模态对话中，带有稍微清晰一些的音频或高清图片就会轻松突破 5MB，直接被平台粗暴返回 `413 Payload Too Large`。因此，通过自建 VPS 托管是获得满血体验的最佳路径。
 
-*自托管 VPS 是唯一受祝福的登台之选。Vercel 等平台所设下的 4.5MB 入站硬限制，会把每一次厚重的高品质音频与多模态请求变成无情的 `413 Payload Too Large`。Summeretto 的诞生，正是为了冲破那道枷锁，飞向无界的天空。*
+### 生产环境 systemd 配置示例
 
-<br>
-
-**A battle-tested production `systemd` unit requires three crucial directives:**
+创建 systemd 服务单元（如 `/etc/systemd/system/summeretto.service`），注意三个核心配置项：
 
 ```ini
+[Unit]
+Description=Summeretto Gemini Robin Proxy
+After=network.target
+
 [Service]
-# 1. Body ceiling must accommodate genuine multimodal payloads (32MB)
+Type=simple
+User=youruser
+WorkingDirectory=/path/to/Summeretto/service
+ExecStart=/usr/bin/node server.mjs
+Restart=always
+RestartSec=5
+
+# 1. 放开请求体上限，容纳多模态大包（建议 32MB）
 Environment=MAX_BODY_BYTES=33554432
 
-# 2. Memory ceiling — peak memory is 5–6× the payload size during streaming
+# 2. 内存上限：流式多模态传输峰值约为体积的 5~6 倍，推荐 384MB
 MemoryMax=384M
 
-# 3. ★ ProtectHome blocks token persistence into .env.
-#    Grant read-write access to the entire DIRECTORY, not just the file!
+# 3. ★ 务必开放【整个 service 目录】的读写权限，以便回写 .env token
 ReadWritePaths=/path/to/Summeretto/service
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-*一套经历过实战淬炼的生产级 `systemd` 配置，切记三大要领：*
+### 安全重启守则
 
-```ini
-[Service]
-# 1. 入站上限必须容纳真实的多模态大包（32MB）
-Environment=MAX_BODY_BYTES=33554432
-
-# 2. 内存上限——流式传输时的峰值可达载荷本身的 5~6 倍
-MemoryMax=384M
-
-# 3. ★ ProtectHome 会阻断 master token 回写至 .env。
-#    务必开放【整个工作目录】的读写权限，而非单独一个文件！
-ReadWritePaths=/path/to/Summeretto/service
-```
-
-<br>
-
-**Deployment restart discipline, etched in blood:**
+在需要重启服务时，请先检查是否有在途请求：
 
 ```bash
-# BEFORE restarting — confirm that no singer is currently mid-song!
+# 重启前检查是否有正在歌唱的在途请求
 curl -s http://127.0.0.1:3000/healthz | python3 -c \
   "import sys,json; d=json.load(sys.stdin); \
-   assert d['inflight']['inflight']==0, 'IN-FLIGHT REQUEST RUNNING — DO NOT RESTART'; \
-   print('Safe to restart')"
+   assert d['inflight']['inflight']==0, '尚有在途请求未完成，切勿强行重启！'; \
+   print('安全，可以重启')"
 
-sudo systemctl restart summeretto  # (or your chosen systemd unit name)
-```
-
-*以昂贵教训换来的部署铁律：*
-
-```bash
-# 任何重启之前——务必确认是否有歌者正处于演唱半途！
-curl -s http://127.0.0.1:3000/healthz | python3 -c \
-  "import sys,json; d=json.load(sys.stdin); \
-   assert d['inflight']['inflight']==0, '尚有在途请求正在歌唱——切勿重启'; \
-   print('可以安全重启')"
-
-sudo systemctl restart summeretto  # （或你配置的 systemd unit 名称）
+sudo systemctl restart summeretto
 ```
 
 ---
 
-## ◆ Quota Reality · 配额真相：算力纪元的清醒法则
+## 📊 Quota Reality · 算力配额说明
 
-<br>
+从 2026 年中旬起，Google 对 Gemini 的 5 小时滑动窗口配额已经全面改为**按实际算力（Compute）计量**，而不再是简单的“使用次数”：
+$$\text{单次开销} \propto \text{提示词复杂度} \times \text{模型档位乘区} \times \text{功能加权} \times \text{上下文历史长度}$$
 
-**Since mid-2026, Gemini's quota window meters compute, not simplistic request counters.**  
-`Prompt Complexity × Model Tier × Feature Multipliers × Context History Length (every turn re-reads the full history)`. The myth of a static "uses per day" has vanished.
-
-<br>
-
-> *自 2026 年中旬起，Gemini 的配额窗口按**真实算力**进行计量，而非浅薄的请求次数。*  
-> `提示词复杂度 × 模型档位 × 功能加权乘区 × 上下文长度（每一轮皆需重新审阅全量历史）`。所谓的“每天能用固定多少次”，早已成为历史的幻影。
-
-<br>
-
-**The true cost floor of a single conversation turn is not media attachments — it is the ~26.5k tokens of tool declarations and re-read dialog history carried on every interaction. Keep your prompt engineering disciplined, and your rhapsody will echo far across the stars.**
-
-*单次调用的真实算力底噪往往不是外挂媒体，而是每一轮交互都必须随行携带的、约 26.5k token 的工具声明与全量历史重审。保持精简严密的工程调律，你的晴歌方能在星海中经久回荡。*
+> 💡 **实用建议**：在多轮对话中，每一轮交互其实都会将前面所有的历史对话以及约 26.5k token 的工具声明完整重读一遍。因此，保持 Prompt 和历史上下文的简洁，是避免触碰配额墙的最有效手段。
 
 ---
 
-## ✦ Epilogue · 终章：你将起身歌唱
+## 🌸 Epilogue · 尾声
 
-<br>
+庭园的门扉其实从未锁死，它只是在用一门独特的双向流语言歌唱。现在，一切障碍已被扫除。
 
-### *「你将起身歌唱，跃入这片蔚蓝狂想。」*
-
-**The garden was never truly sealed. It was merely singing in an ancient tongue that few had the courage to learn.**
-
-**Summeretto learned it. And now, the stage is yours.**
-
-**Listen — Robin is singing in the summer breeze.**
-
-<br>
-
-> *庭园从未真正封闭，宇宙亦不曾真正沉寂。它只是用一门少有人敢于倾听与破译的古老语言歌唱。*
->
-> *Summeretto 学会了它。而现在，这片舞台属于你。*
->
-> *听——知更鸟正在盛夏的微风中轻啼。*
-
-<br>
+祝你使用愉快，尽情享受知更鸟小姐带来的流式拉条晴歌吧！
 
 <div align="center">
 
 ### **Miss Robin • Summeretto awaits your stream-song.**
-### **知更鸟·晴歌，静候你的下一次盛夏拉条。**
+### **知更鸟·晴歌，等候你的下一次盛夏拉条。**
 
 `https://github.com/0xcr1st0f0r0/Summeretto`
 
