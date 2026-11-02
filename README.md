@@ -86,6 +86,14 @@ http://127.0.0.1:3000/login
 ```
 按照内置的简洁网页引导完成一次 Google 账号授权，系统会自动帮你铸造出长效的 `GSA_MASTER_TOKEN` 并自动回写落盘到 `.env` 中。后续服务端会自动管理和刷新短期访问令牌。
 
+管理后台（可选，需配置 `ADMIN_KEY`）：
+```
+http://127.0.0.1:3000/admin
+```
+输入 Admin Key 进入，一屏看完**存活状态、账号剩余额度、心跳测试、HTTP/2 会话与最近日志**。
+登录后由服务端下发签名 Cookie（HttpOnly），页面不保存 Admin Key。
+详见 [service/README.md §十一](service/README.md)。
+
 ### 3. 验证服务状态
 
 使用 `curl` 检查服务是否就绪：
@@ -298,6 +306,8 @@ sudo systemctl restart summeretto
 cd service
 docker compose up -d --build
 ```
+
+容器内同样提供 `/login` 与 `/admin` 两个页面（`ADMIN_KEY` 需自行配置）。
 
 完整构建、运行与持久化说明见 **[`service/Docker.md`](service/Docker.md)**。
 

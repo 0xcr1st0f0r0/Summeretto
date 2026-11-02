@@ -34,7 +34,7 @@ let session = null;
 //   ② 轮换 rotate：按最大存活时长 / 最大复用次数主动换连接，
 //      防 stream ID 耗尽与长连接幽灵。
 //   ③ 心跳 ping：空闲时定期 ping 探活，ping 不回即判定半死并销毁。
-let sessionStat = { bornAt: 0, requests: 0, poisoned: 0, rotated: 0 };
+let sessionStat = { bornAt: 0, requests: 0, poisoned: 0, rotated: 0, connected: false };
 let pingTimer = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -62,7 +62,7 @@ function sessionStaleReason() {
 function poisonSession(reason) {
   const s = session;
   session = null;
-  sessionStat = { bornAt: 0, requests: 0, poisoned: sessionStat.poisoned + 1, rotated: sessionStat.rotated };
+  sessionStat = { bornAt: 0, requests: 0, poisoned: sessionStat.poisoned + 1, rotated: sessionStat.rotated, connected: false };
   clearTimeout(pingTimer);
   pingTimer = null;
   if (s && !s.destroyed) {
@@ -77,7 +77,7 @@ function poisonSession(reason) {
 function rotateSession(reason) {
   const s = session;
   session = null;
-  sessionStat = { bornAt: 0, requests: 0, poisoned: sessionStat.poisoned, rotated: sessionStat.rotated + 1 };
+  sessionStat = { bornAt: 0, requests: 0, poisoned: sessionStat.poisoned, rotated: sessionStat.rotated + 1, connected: false };
   clearTimeout(pingTimer);
   pingTimer = null;
   if (s && !s.closed && !s.destroyed) {
@@ -145,18 +145,30 @@ function getSession() {
   }
   const s = http2.connect(config.robinUrl, { settings: { enablePush: false } });
   session = s;
-  sessionStat = { bornAt: now, requests: 0, poisoned: sessionStat.poisoned, rotated: sessionStat.rotated };
+  sessionStat = { bornAt: now, requests: 0, poisoned: sessionStat.poisoned, rotated: sessionStat.rotated, connected: false };
   // ★ 身份比较：旧会话迟到的 error/goaway/close 不得把**新**会话清成 null
   //   （issue #4 的场景里会话会被反复替换，不做身份比较必然误伤新连接）
+  s.on("connect", () => {
+    if (session === s) sessionStat.connected = true;
+  });
   s.on("error", (err) => {
     console.error("[robin] session error:", err?.message);
-    if (session === s) session = null;
+    if (session === s) {
+      session = null;
+      sessionStat.connected = false;
+    }
   });
   s.on("goaway", () => {
-    if (session === s) session = null;
+    if (session === s) {
+      session = null;
+      sessionStat.connected = false;
+    }
   });
   s.on("close", () => {
-    if (session === s) session = null;
+    if (session === s) {
+      session = null;
+      sessionStat.connected = false;
+    }
   });
   armSessionWatchdog(s);
   return s;
@@ -167,8 +179,90 @@ export function closeRobinSession() {
   pingTimer = null;
   const s = session;
   session = null;
-  sessionStat = { bornAt: 0, requests: 0, poisoned: sessionStat.poisoned, rotated: sessionStat.rotated };
+  sessionStat = { bornAt: 0, requests: 0, poisoned: sessionStat.poisoned, rotated: sessionStat.rotated, connected: false };
   if (s && !s.closed) s.close();
+}
+
+/**
+ * ★ 会话状态快照（供 /admin 后台的「会话」卡片）。
+ *
+ * 半死连接（issue #4）最直观的信号就是「连接还在但一个字节都收不到」，
+ * 所以这里把会话的年龄、复用次数、毒化/轮换计数一并暴露出来。
+ */
+export function sessionStatus() {
+  const s = session;
+  return {
+    alive: Boolean(s && !s.closed && !s.destroyed),
+    connected: sessionStat.connected,
+    bornAt: sessionStat.bornAt ? new Date(sessionStat.bornAt).toISOString() : null,
+    ageMs: sessionStat.bornAt ? Date.now() - sessionStat.bornAt : null,
+    requests: sessionStat.requests,
+    poisoned: sessionStat.poisoned,
+    rotated: sessionStat.rotated,
+    limits: {
+      maxAgeMs: config.robinSessionMaxAgeMs,
+      maxRequests: config.robinSessionMaxRequests,
+      pingIdleMs: config.robinSessionPingIdleMs,
+      pingTimeoutMs: config.robinSessionPingTimeoutMs,
+    },
+  };
+}
+
+/**
+ * ★ 心跳探活：对当前 HTTP/2 会话发一个 PING，测它是否还活着。
+ *
+ * 为什么需要：半死连接（TCP 没断、socket 不报错、但数据送不到服务端）
+ * 不会触发任何 Node 事件，只有 PING 的 ACK 能暴露它 —— 这正是 issue #4 里
+ * 「requests 全量 frames=0 且不自愈」的探测手段。
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.createIfMissing=true] 无会话时是否先建一条
+ * @param {number}  [opts.timeoutMs=5000]        PING 无回应的判定超时
+ */
+export async function pingRobinSession({ createIfMissing = true, timeoutMs = 5000 } = {}) {
+  let s;
+  try {
+    s = createIfMissing ? getSession() : session;
+  } catch (err) {
+    return { ok: false, error: `connect_failed: ${err?.message}`, ms: 0 };
+  }
+  if (!s || s.closed || s.destroyed) return { ok: false, error: "no_session", ms: 0 };
+
+  // ★ 会话还在建连时不能 ping —— Node 会直接取消（ERR_HTTP2_PING_CANCEL）。
+  //   不用 session.connected（该属性在 Node 22 并不存在，`in` 判断为 false），
+  //   而是自己记连接状态（sessionStat.connected，由 'connect' 事件置位）。
+  if (!sessionStat.connected) {
+    const ready = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve(false), timeoutMs);
+      const onReady = () => { clearTimeout(t); resolve(true); };
+      const onFail = () => { clearTimeout(t); resolve(false); };
+      s.once("connect", onReady);
+      s.once("error", onFail);
+      s.once("close", onFail);
+    });
+    if (!ready) return { ok: false, error: "session_not_ready", ms: 0 };
+    if (s.closed || s.destroyed) return { ok: false, error: "no_session", ms: 0 };
+  }
+
+  const t0 = Date.now();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (r) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ...r, ms: Date.now() - t0 });
+    };
+    const timer = setTimeout(() => finish({ ok: false, error: "ping_timeout" }), timeoutMs);
+    try {
+      s.ping((err, duration) => {
+        if (err) finish({ ok: false, error: `ping_failed: ${err?.message}` });
+        else finish({ ok: true, rttMs: duration ?? null });
+      });
+    } catch (err) {
+      finish({ ok: false, error: `ping_error: ${err?.message}` });
+    }
+  });
 }
 
 /**

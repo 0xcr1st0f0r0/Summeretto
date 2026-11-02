@@ -849,6 +849,77 @@ ok("★ 幂等去重闭环（同 payload 重发 ⇒ 零上游调用；新意图�
   ok("§19 上游真空 → 会话被销毁 → 后续请求重建连接并恢复（issue #4 回归）");
 }
 
+/* 20. ★ /admin 后台：登录 → 签名 Cookie → 状态 / 日志 / 心跳
+ *
+ *   鉴权模型：页面登录后拿到的是 **HMAC 签名 Cookie**（HttpOnly，密钥 = ADMIN_KEY），
+ *   ADMIN_KEY 本身不落前端；脚本场景仍可用 x-admin-key 头（向后兼容）。 */
+{
+  // ① 未登录 → 给登录表单
+  const r0 = await fetch(`${base}/admin`);
+  assert.equal(r0.status, 200);
+  const html0 = await r0.text();
+  assert.ok(html0.includes("请输入 Admin Key"), "未登录应给登录表单");
+  assert.ok(!html0.includes("存活信息"), "未登录不应泄露仪表盘内容");
+
+  // ② 未授权 / 错 key → 401
+  assert.equal((await fetch(`${base}/admin/api/state`)).status, 401, "未授权应 401");
+  const r2 = await fetch(`${base}/admin/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key: "wrong-key" }),
+  });
+  assert.equal(r2.status, 401, "错 key 应 401");
+
+  // ③ 正确 key → 200 + 签名 Cookie（HttpOnly）
+  const r3 = await fetch(`${base}/admin/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key: "e2e-admin-key" }),
+  });
+  assert.equal(r3.status, 200, "正确 key 应 200");
+  const cookieHeaders = r3.headers.getSetCookie?.() ?? [r3.headers.get("set-cookie")];
+  const cookie = cookieHeaders.find((c) => c && c.startsWith("summeretto_admin="));
+  assert.ok(cookie, "应下发签名 Cookie");
+  assert.ok(cookie.includes("HttpOnly"), "Cookie 应为 HttpOnly");
+  assert.ok(cookie.includes("SameSite=Strict"), "Cookie 应为 SameSite=Strict");
+  const ck = cookie.split(";")[0];
+
+  // ④ 带 Cookie → 仪表盘 + 状态 API
+  const r4 = await fetch(`${base}/admin`, { headers: { cookie: ck } });
+  assert.equal(r4.status, 200);
+  const html4 = await r4.text();
+  for (const panel of ["存活信息", "会话信息（HTTP/2）", "额度信息", "心跳测试", "最近日志"]) {
+    assert.ok(html4.includes(panel), `仪表盘应含「${panel}」面板`);
+  }
+  const r5 = await fetch(`${base}/admin/api/state`, { headers: { cookie: ck } });
+  assert.equal(r5.status, 200);
+  const st = await r5.json();
+  assert.ok(st.ok, "状态应 ok");
+  assert.ok(st.session && typeof st.session.alive === "boolean", "状态应含 session 段");
+  assert.ok(st.credential && st.credential.verdict, "状态应含 credential 判定");
+
+  // ⑤ 日志 API（环形缓冲）
+  const r6 = await fetch(`${base}/admin/api/logs?limit=10`, { headers: { cookie: ck } });
+  assert.equal(r6.status, 200);
+  const lg = await r6.json();
+  assert.ok(Array.isArray(lg.entries), "日志应返回数组");
+  assert.ok(lg.buffer && lg.buffer.enabled, "日志缓冲应已启用");
+
+  // ⑥ 心跳：PING 层必须通（mock 是 h2c，支持 PING）
+  const r7 = await fetch(`${base}/admin/api/heartbeat`, { method: "POST", headers: { cookie: ck } });
+  assert.equal(r7.status, 200);
+  const hb = await r7.json();
+  assert.ok(hb.ping && typeof hb.ping.ok === "boolean", "心跳应含 ping 段");
+  assert.equal(hb.ping.ok, true, `PING 应成功，实际：${hb.ping.error}`);
+
+  // ⑦ 退出 → Cookie 失效，API 回到 401
+  const r8 = await fetch(`${base}/admin/logout`, { method: "POST", headers: { cookie: ck } });
+  assert.equal(r8.status, 200);
+  assert.equal((await fetch(`${base}/admin/api/state`, { headers: { cookie: ck } })).status, 401, "退出后应失效");
+
+  ok("§20 /admin 后台：登录 → 签名 Cookie → 状态/日志/心跳 → 退出失效");
+}
+
 app.close();
 mockServer.close();
 console.log(`\n全部通过：${n} 组断言`);

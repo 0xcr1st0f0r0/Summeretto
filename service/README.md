@@ -527,7 +527,50 @@ Lgaaz { #1 STRING conversationId, #2 Lgauy }   ← protoreach 反推，字段号
 
 ---
 
-## 十一、路线图
+## 十一、★ 后台管理页（`/admin`）
+
+自包含的管理后台（零外部资源，单文件 HTML），把运维要盯的东西收在一处。
+
+| 面板 | 内容 |
+|---|---|
+| **存活信息** | 服务 / 上游 / 凭证判定（valid·stale·expired）/ 令牌剩余 / 在途请求 / 内存 |
+| **会话信息** | HTTP/2 会话：存活状态、已存活时长、本连接请求数、**毒化 / 轮换次数**（§十的三道防线状态） |
+| **额度信息** | 账号剩余额度（5 小时窗口 / 周窗口）+ 重置时间（走 `GetUsageInfo`） |
+| **心跳测试** | ① PING 探传输层存活（半死连接只有它能暴露）② GetUserStatus 端到端（令牌 + 上游） |
+| **运行时开关** | 入站上限、附件上限、会话隔离、限流、总时限、凭证落盘 |
+| **最近日志** | 进程日志环形缓冲（内存，300 条；重启即清空） |
+
+### 鉴权模型
+
+- **登录**：输入 `ADMIN_KEY` → 服务端下发 **HMAC-SHA256 签名 Cookie**
+  （`HttpOnly` + `SameSite=Strict` + 12h 时效）—— **ADMIN_KEY 本身不落前端**，页面 JS 也读不到 Cookie。
+- **退出**：`POST /admin/logout` → 服务端**作废**已签发的 Cookie（不只是让浏览器删），
+  手工重放旧 Cookie 会立刻 401。
+- **向后兼容**：所有 admin 端点仍接受 `x-admin-key` 请求头（脚本 / curl 场景不受影响）。
+- 未配置 `ADMIN_KEY` 时，`/admin` 与全部 admin 端点整体关闭（404）。
+
+### 端点
+
+```
+GET  /admin                后台页（未登录给登录表单，已登录给仪表盘）
+POST /admin/login          {key} → 下发签名 Cookie
+POST /admin/logout         作废当前会话
+GET  /admin/api/state      状态聚合（只读，不发推理请求）
+GET  /admin/api/logs       最近日志（?limit=200）
+POST /admin/api/heartbeat  心跳测试（PING + GetUserStatus 两层）
+POST /admin/api/usage      额度查询
+```
+
+### 两个刻意的设计取舍
+
+1. **额度查询走独立子进程**（`optional/usage-info/query.mjs --enable`），不把它的模块
+   import 进网关 —— 那个 CLI 明确「never imported by the gateway」，隔离是有意为之的；
+   顺带避免第二个 HTTP/2 会话去和主会话抢同一份凭证状态。
+2. **状态聚合只读** —— 不碰凭证、不发推理请求，纯把各模块的状态函数拼起来。
+
+---
+
+## 十二、路线图
 
 - [x] Node 选型 + Vercel 骨架 + wire 编解码
 - [x] **协议层 `pq.js`（请求装配 + 响应解析，字段号全部有字节码证据）**
