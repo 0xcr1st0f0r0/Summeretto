@@ -40,6 +40,18 @@ const UPSTREAM = (process.env.UPSTREAM ?? "http://127.0.0.1:3000").replace(/\/+$
 const EMPTY_RETRY = Number(process.env.EMPTY_RETRY ?? 1);
 const EMPTY_RETRY_DELAY_MS = Number(process.env.EMPTY_RETRY_DELAY_MS ?? 500);
 
+// ── 鉴权 ────────────────────────────────────────────────────────────────
+// 上游若配置了 PROXY_API_KEY，则所有 /v1beta 路由都要带 key。
+// UPSTREAM_KEY：桥自己调上游时用的凭据（= 上游的 PROXY_API_KEY）。
+//   留空 = 上游未开鉴权，桥不注入任何 key。
+// CLIENT_KEY：桥要求客户端出示的凭据。
+//   留空 = 不校验客户端（仅适合单机自用）。
+//   设置后，客户端必须在 Authorization: Bearer / x-goog-api-key 里带上它。
+// ★ 两者独立：桥对上游用 UPSTREAM_KEY，对客户端用 CLIENT_KEY，
+//   这样「桥的出网凭据」不会因客户端乱填 API Key 而被打回。
+const UPSTREAM_KEY = String(process.env.UPSTREAM_KEY ?? "").trim();
+const CLIENT_KEY = String(process.env.CLIENT_KEY ?? "").trim();
+
 const H = {
   "content-type": "application/json; charset=utf-8",
   "access-control-allow-origin": "*",
@@ -180,7 +192,7 @@ function geminiToOpenAI(gem, model) {
 /* ─────────────────────────── 调用上游 ─────────────────────────── */
 
 /** 非流式调用（带空响应重试） */
-async function callUpstream(model, body, apiKey) {
+async function callUpstream(model, body) {
   const url = `${UPSTREAM}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
   let attempt = 0;
   let last = null;
@@ -188,7 +200,7 @@ async function callUpstream(model, body, apiKey) {
   while (attempt <= EMPTY_RETRY) {
     attempt++;
     const headers = { "content-type": "application/json" };
-    if (apiKey) headers["x-goog-api-key"] = apiKey;
+    if (UPSTREAM_KEY) headers["x-goog-api-key"] = UPSTREAM_KEY;
 
     const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
@@ -218,9 +230,16 @@ const MODEL_TTL = 60_000;
 async function listModels() {
   if (modelCache.data && Date.now() - modelCache.at < MODEL_TTL) return modelCache.data;
 
+  // 上游的 /v1beta/models 同样受 PROXY_API_KEY 保护，必须带凭据
+  const headers = {};
+  if (UPSTREAM_KEY) headers["x-goog-api-key"] = UPSTREAM_KEY;
+
   let r;
   try {
-    r = await fetch(`${UPSTREAM}/v1beta/models`, { signal: AbortSignal.timeout(8000) });
+    r = await fetch(`${UPSTREAM}/v1beta/models`, {
+      headers,
+      signal: AbortSignal.timeout(8000),
+    });
   } catch (err) {
     if (modelCache.data) {
       console.warn(`[openai-shim] 上游不可达（${err?.message}），返回过期缓存`);
@@ -243,10 +262,10 @@ async function listModels() {
 
 /* ─────────────────────────── 流式转发 ─────────────────────────── */
 
-async function streamChat(req, res, model, body, apiKey) {
+async function streamChat(req, res, model, body) {
   const url = `${UPSTREAM}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
   const headers = { "content-type": "application/json" };
-  if (apiKey) headers["x-goog-api-key"] = apiKey;
+  if (UPSTREAM_KEY) headers["x-goog-api-key"] = UPSTREAM_KEY;
 
   const up = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
   if (!up.ok || !up.body) {
@@ -326,7 +345,8 @@ async function streamChat(req, res, model, body, apiKey) {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const path = url.pathname.replace(/\/+$/, "") || "/";
-  const apiKey =
+  // 客户端出示的凭据（仅用于校验客户端身份，不透传给上游）
+  const clientKey =
     req.headers["x-goog-api-key"] ??
     String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "") ??
     "";
@@ -334,6 +354,13 @@ const server = createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, H);
     return res.end();
+  }
+
+  // ── 客户端鉴权 ──
+  // CLIENT_KEY 留空 = 不校验（单机自用）；设置后必须出示匹配的凭据。
+  // /healthz 不参与鉴权：它是容器健康检查与诊断入口。
+  if (CLIENT_KEY && path !== "/healthz" && clientKey !== CLIENT_KEY) {
+    return sendErr(res, 401, "API key missing or invalid", "authentication_error");
   }
 
   try {
@@ -363,9 +390,9 @@ const server = createServer(async (req, res) => {
       const model = normalizeModel(body?.model);
       const geminiBody = toGeminiBody(body);
 
-      if (body?.stream) return await streamChat(req, res, model, geminiBody, apiKey);
+      if (body?.stream) return await streamChat(req, res, model, geminiBody);
 
-      const { status, json } = await callUpstream(model, geminiBody, apiKey);
+      const { status, json } = await callUpstream(model, geminiBody);
       if (status !== 200) {
         return sendErr(res, status, json?.error?.message ?? "上游调用失败", "upstream_error");
       }
@@ -383,5 +410,11 @@ server.listen(PORT, HOST, () => {
   console.log(`[openai-shim] 已启动  http://${HOST}:${PORT}/v1`);
   console.log(`[openai-shim] 上游    ${UPSTREAM}（Gemini 原生）`);
   console.log(`[openai-shim] 空响应重试 ${EMPTY_RETRY} 次`);
+  console.log(
+    `[openai-shim] 鉴权    客户端 ${CLIENT_KEY ? "已开启（需携带 API Key）" : "未开启（任何人可调用）"}`,
+  );
+  console.log(
+    `[openai-shim] 上游凭据 ${UPSTREAM_KEY ? "已配置（UPSTREAM_KEY）" : "未配置（上游应无鉴权）"}`,
+  );
   console.log(`[openai-shim] 客户端 Base URL 填： http://${HOST}:${PORT}/v1`);
 });

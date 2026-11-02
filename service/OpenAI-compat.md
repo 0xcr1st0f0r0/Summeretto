@@ -41,11 +41,35 @@ UPSTREAM=http://127.0.0.1:3000 SHIM_PORT=8081 node openai-shim.mjs
 
 ```
 Base URL = http://127.0.0.1:8081/v1
-API Key  = 任意字符串
+API Key  = 见下方「鉴权」一节
 ```
 
-> 主服务若设置了 `PROXY_API_KEY`，客户端需带 `x-goog-api-key`（或 `Authorization: Bearer`），
-> 桥会原样透传；未设置时桥与主服务都不校验。
+### 鉴权（两个独立密钥）
+
+桥有两层凭据，**互相独立**，不要混用：
+
+| 环境变量 | 作用 | 谁需要知道 |
+|---|---|---|
+| `UPSTREAM_KEY` | 桥**调用主服务**时携带的凭据 | = 主服务的 `PROXY_API_KEY`（只有桥知道） |
+| `CLIENT_KEY` | 桥**要求客户端出示**的凭据 | 填进第三方客户端的 API Key |
+
+```bash
+# 主服务开鉴权时，桥必须自带凭据
+UPSTREAM=http://127.0.0.1:3000 \
+UPSTREAM_KEY=<主服务的 PROXY_API_KEY> \
+CLIENT_KEY=<给客户端的密钥> \
+node openai-shim.mjs
+```
+
+- `UPSTREAM_KEY` 留空 → 桥不注入凭据（适用于主服务未开鉴权的场景）
+- `CLIENT_KEY` 留空 → 桥不校验客户端（仅适合单机自用）
+
+> ★ 为什么不用「客户端的 key 直接透传」：那样客户端随便填个字符串就会把桥自己的
+> 出网请求一起打回 401（主服务校验的是它自己的 `PROXY_API_KEY`）。
+> 拆成两个密钥后，客户端填错只会被桥拒（401），不会影响桥到上游的链路。
+>
+> 主服务的 `/v1beta/*` 全路由都受 `PROXY_API_KEY` 保护（含 `/v1beta/models`），
+> 所以桥拉模型列表时同样会带上 `UPSTREAM_KEY`。
 
 ## 3. 端点映射
 
