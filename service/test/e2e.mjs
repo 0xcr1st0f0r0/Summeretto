@@ -29,6 +29,10 @@ process.env.ADMIN_KEY = "e2e-admin-key";
 // 限流是防扫薅的 best-effort 机制，e2e 不测它（整套跑下来请求数本就逼近 30/min 默认值，
 // 会把正常用例误判成 429）。这里显式放开，专注验证去重/重试/降级等逻辑本身。
 process.env.RATE_LIMIT_MAX = "100000";
+// ★ issue #4 回归用：把「上游真空」的快速失败宽限压到 1s（默认 10s），
+//   否则「服务端一个字节都不回」的用例要干等 10s。正常用例不受影响
+//   （mock 5ms 内就应答，idle 定时器根本不会触发）。
+process.env.ROBIN_IDLE_MS = "1000";
 
 const { handle } = await import("../lib/app.js");
 const { guardStatus, __resetGuardForTest } = await import("../lib/degrade-guard.js");
@@ -804,6 +808,45 @@ ok("★ 幂等去重闭环（同 payload 重发 ⇒ 零上游调用；新意图�
   assert.equal(h1.emptyRetry.exhausted - h0.emptyRetry.exhausted, 1, "应记录 1 次耗尽");
   assert.equal(h1.emptyRetry.successes - h0.emptyRetry.successes, 0, "不应有成功");
   ok("§17.2 连续空响应 → 2 次尝试后放弃（不拖过预算；healthz 记账）");
+}
+
+/* 19. ★ issue #4 回归：上游真空 → HTTP/2 会话被毒化销毁 → 后续请求重建连接并恢复
+ *
+ *   issue #4 实证的症状：一次「上游真空」后，客户端继续复用那条半死连接，
+ *   后续**所有**请求都是 frames=0（「【A 上游真空】未收到任何帧」），持续上千次
+ *   且不会自愈，只有 docker restart 能恢复。
+ *
+ *   mock 侧：TRIGGER_VACUUM 让**当前这条连接**从此不响应（真实模拟「TCP 半死」：
+ *   连接还在、请求也送到了，但服务端一个字节都不回）；新建连接则正常应答。
+ *   ⇒ 未修复时，第二个请求会复用半死连接 → 同样 frames=0 → 本用例失败。
+ *   ⇒ 修复后，客户端在真空请求结束时 destroy 该会话 → 第二个请求重建连接 → 成功。 */
+{
+  const connBefore = seen.connections;
+
+  // ① 真空请求：mock 挂起不响应 → 客户端 idle 超时 → frames=0（空正文）
+  const r1 = await fetch(`${base}/v1beta/models/gemini-4-argon:generateContent`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "TRIGGER_VACUUM 触发半死连接" }] }] }),
+  });
+  assert.equal(r1.status, 200, "真空请求应返回（空）响应而不报错");
+  const t1 = (await r1.json()).candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+  assert.equal(t1, "", "真空请求应为空正文（上游一个字节都没回）");
+
+  // ② 随后的普通请求必须走**新连接**并成功
+  const r2 = await fetch(`${base}/v1beta/models/gemini-4-argon:generateContent`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "真空之后恢复正常" }] }] }),
+  });
+  assert.equal(r2.status, 200);
+  const t2 = (await r2.json()).candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+  assert.ok(t2.includes("真空之后恢复正常"), `毒化后应恢复应答，实际：${JSON.stringify(t2)}`);
+  assert.ok(
+    seen.connections > connBefore,
+    `毒化后必须重建连接（连接数 ${connBefore} → ${seen.connections}）`,
+  );
+  ok("§19 上游真空 → 会话被销毁 → 后续请求重建连接并恢复（issue #4 回归）");
 }
 
 app.close();

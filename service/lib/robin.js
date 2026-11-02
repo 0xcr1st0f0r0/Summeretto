@@ -18,7 +18,113 @@ import { getRobinToken, invalidateMintedToken, canRemint } from "./auth.js";
 
 let session = null;
 
+// ── ★ HTTP/2 会话健康与轮换（2026-11-02，修 issue #4）────────────────────────
+// 症状（issue #4 实证）：长期运行后偶发一次总时限超时或网络短暂丢包，随后
+//   **所有**后续请求全量陷入「【A 上游真空】未收到任何帧」（frames=0），
+//   连续上千次且**不会自愈**，只有 docker restart 能恢复。
+//
+// 根因：TCP「半死」（跨国链路 / NAT / 透明代理静默丢包，收不到 FIN/RST）时，
+//   Node 侧既不 closed 也不 destroyed ⇒ getSession() 继续复用这条死连接 ⇒
+//   新 stream 的数据送不到服务端，收不到任何 ACK 帧（frames=0）。
+//   此前 closeRobinSession() 虽已导出，但运行时**从未被调用**（issue 实证）。
+//
+// 三道防线：
+//   ① 毒化 poison：请求结束时若「一个字节都没收到」⇒ destroy 该会话，
+//      下次请求重新握手。**这是根治手段**（半死连接上 close 无效，必须 destroy）。
+//   ② 轮换 rotate：按最大存活时长 / 最大复用次数主动换连接，
+//      防 stream ID 耗尽与长连接幽灵。
+//   ③ 心跳 ping：空闲时定期 ping 探活，ping 不回即判定半死并销毁。
+let sessionStat = { bornAt: 0, requests: 0, poisoned: 0, rotated: 0 };
+let pingTimer = null;
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 会话是否已达轮换阈值 → 返回原因字符串（未达阈值返回 null） */
+function sessionStaleReason() {
+  const maxAge = config.robinSessionMaxAgeMs;
+  if (maxAge > 0 && sessionStat.bornAt && Date.now() - sessionStat.bornAt >= maxAge) {
+    return `老化 ${maxAge}ms`;
+  }
+  const maxReq = config.robinSessionMaxRequests;
+  if (maxReq > 0 && sessionStat.requests >= maxReq) {
+    return `复用次数达 ${maxReq}`;
+  }
+  return null;
+}
+
+/**
+ * ★ 毒化并销毁会话（issue #4 的根治手段）。
+ *
+ * 为什么用 destroy() 而不是 close()：close() 是「优雅关闭」，需要服务端配合
+ * 完成在途流；半死连接上服务端根本不在，收不到 GOAWAY 的回应，close() 会
+ * 挂在那里直到超时，连接依然是死的。destroy() 直接掐断底层 socket。
+ */
+function poisonSession(reason) {
+  const s = session;
+  session = null;
+  sessionStat = { bornAt: 0, requests: 0, poisoned: sessionStat.poisoned + 1, rotated: sessionStat.rotated };
+  clearTimeout(pingTimer);
+  pingTimer = null;
+  if (s && !s.destroyed) {
+    try {
+      s.destroy();
+    } catch {}
+  }
+  console.warn(`[robin] 会话已销毁（${reason}）—— 下次请求将重新握手`);
+}
+
+/** 平滑轮换：close() 发 GOAWAY，让在途请求自然收尾，不粗暴掐断 */
+function rotateSession(reason) {
+  const s = session;
+  session = null;
+  sessionStat = { bornAt: 0, requests: 0, poisoned: sessionStat.poisoned, rotated: sessionStat.rotated + 1 };
+  clearTimeout(pingTimer);
+  pingTimer = null;
+  if (s && !s.closed && !s.destroyed) {
+    try {
+      s.close();
+    } catch {}
+  }
+  console.log(`[robin] 会话轮换（${reason}）`);
+}
+
+/**
+ * ③ 心跳探活：定期 ping，ping 不回 = 连接半死 ⇒ 销毁。
+ *
+ * 半死连接上 socket 不会报错、也不会触发 'close'，只有 ping 的回调能暴露它
+ * （Node 会把 ping 的 ACK 送到 socket；socket 半死则永远等不到 ACK）。
+ * 定时器 unref —— 不阻止进程退出（Vercel serverless 下尤其重要）。
+ */
+function armSessionWatchdog(s) {
+  clearTimeout(pingTimer);
+  const idleMs = config.robinSessionPingIdleMs;
+  if (idleMs <= 0) return;
+  pingTimer = setTimeout(() => {
+    if (session !== s || s.closed || s.destroyed) return;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      poisonSession(`ping 超时 ${config.robinSessionPingTimeoutMs}ms（连接疑似半死）`);
+    }, config.robinSessionPingTimeoutMs);
+    try {
+      s.ping((err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) poisonSession(`ping 失败：${err?.message}`);
+        else armSessionWatchdog(s); // 连通，下一轮
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      if (!settled) {
+        settled = true;
+        poisonSession(`ping 异常：${err?.message}`);
+      }
+    }
+  }, idleMs);
+  if (typeof pingTimer.unref === "function") pingTimer.unref();
+}
 
 /** 从 extractResponse 结果里挑出非空的元信息字段（供 onFrame 透传） */
 const META_KEYS = ["cumulative", "language", "conversationId", "responseId", "title", "model",
@@ -30,24 +136,39 @@ function pick(ex) {
 }
 
 function getSession() {
-  if (session && !session.closed && !session.destroyed) return session;
-  session = http2.connect(config.robinUrl, { settings: { enablePush: false } });
-  session.on("error", (err) => {
+  const now = Date.now();
+  if (session && !session.closed && !session.destroyed) {
+    // ② 轮换：超过存活时长 / 复用次数上限就换一条新连接
+    const stale = sessionStaleReason();
+    if (!stale) return session;
+    rotateSession(stale);
+  }
+  const s = http2.connect(config.robinUrl, { settings: { enablePush: false } });
+  session = s;
+  sessionStat = { bornAt: now, requests: 0, poisoned: sessionStat.poisoned, rotated: sessionStat.rotated };
+  // ★ 身份比较：旧会话迟到的 error/goaway/close 不得把**新**会话清成 null
+  //   （issue #4 的场景里会话会被反复替换，不做身份比较必然误伤新连接）
+  s.on("error", (err) => {
     console.error("[robin] session error:", err?.message);
-    session = null;
+    if (session === s) session = null;
   });
-  session.on("goaway", () => {
-    session = null;
+  s.on("goaway", () => {
+    if (session === s) session = null;
   });
-  session.on("close", () => {
-    session = null;
+  s.on("close", () => {
+    if (session === s) session = null;
   });
-  return session;
+  armSessionWatchdog(s);
+  return s;
 }
 
 export function closeRobinSession() {
-  if (session && !session.closed) session.close();
+  clearTimeout(pingTimer);
+  pingTimer = null;
+  const s = session;
   session = null;
+  sessionStat = { bornAt: 0, requests: 0, poisoned: sessionStat.poisoned, rotated: sessionStat.rotated };
+  if (s && !s.closed) s.close();
 }
 
 /**
@@ -110,12 +231,18 @@ export async function unaryRpc(methodName, payload, opts = {}) {
       settled = true;
       clearTimeout(timer);
       if (error) result.error = error;
+      // ★ issue #4：连响应体 + trailers 都没收到 ⇒ 连接已废 ⇒ 销毁（与 processQuery 同理）
+      if (!result.body && !result.grpcStatus) {
+        poisonSession("unary RPC 未收到任何响应");
+      }
       resolve(result);
     };
 
     let stream;
     try {
-      stream = getSession().request({
+      const s = getSession();
+      sessionStat.requests++; // 复用计数（轮换阈值用）
+      stream = s.request({
         ":method": "POST",
         ":path": path,
         "content-type": "application/grpc",
@@ -349,6 +476,14 @@ async function processQueryOnce({
       clearTimeout(totalTimer);
       clearTimeout(idleTimer);
       if (error) result.error = error;
+      // ★ issue #4 根治：本次请求「一个字节都没收到」⇒ 这条 HTTP/2 连接已不可信
+      //   （半死连接：TCP 没断、socket 不报错，但数据送不到服务端）⇒ 销毁它，
+      //   下次请求重新握手。否则它会被无限复用，后续请求全量 frames=0 且不自愈。
+      //   判据 = frames===0 **且**没收到 grpc-status：服务端若正常回了 trailers
+      //   （grpc-status=0）只是正文为空，那条连接是好的，不该销毁。
+      if (result.frames === 0 && !result.grpcStatus) {
+        poisonSession(`本次请求未收到任何帧（endedBy=${result.endedBy ?? "?"}）`);
+      }
       // 取证缓冲挂载：仅 capture 开启且确有帧时携带（空响应时由 degrade-guard 落盘）
       if (cap && cap.log.length) result.rawFrames = cap.log;
       resolve(result);
@@ -393,6 +528,7 @@ async function processQueryOnce({
     let stream;
     try {
       const sessionRef = getSession();
+      sessionStat.requests++; // 复用计数（轮换阈值用）
       const headers = {
         ":method": "POST",
         ":path": config.robinPath,
