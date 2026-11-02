@@ -180,7 +180,8 @@ Summeretto 内部每 10 分钟自动与上游同步一次真实档位表：
 ```text
 1. 客户端没收到，绝不代表上游没扣费！
 2. 掐断网络连接，只是断了接收的耳朵，上游算力的齿轮依然在转动。
-3. 任何重启操作之前，必须检查 /healthz 中的 inflight 计数；只要大于 0，必须等待歌者唱完。
+3. 任何重启操作之前，必须检查 /healthz 中的 inflight 计数；**大于 1** 必须等待歌者唱完
+   （该计数含本次探测自身，静止时恒为 1，真实在途数 = inflight - 1）。
 ```
 
 * **防线一**：`lib/dedup.js` —— 90 秒滑动窗口内逐字节对比，若发现重复请求直接重放上次缓存流，**零上游调用**。
@@ -276,9 +277,11 @@ WantedBy=multi-user.target
 
 ```bash
 # 重启前检查是否有正在歌唱的在途请求
+# ⚠️ /healthz 的 inflight **含本次探测自身**（探测也是一个请求），
+#    故静止时恒为 1 —— 真实在途数 = inflight - 1。判据是「> 1 才算有在途」。
 curl -s http://127.0.0.1:3000/healthz | python3 -c \
   "import sys,json; d=json.load(sys.stdin); \
-   assert d['inflight']['inflight']==0, '尚有在途请求未完成，切勿强行重启！'; \
+   assert d['inflight']['inflight']<=1, '尚有在途请求未完成，切勿强行重启！'; \
    print('安全，可以重启')"
 
 sudo systemctl restart summeretto
