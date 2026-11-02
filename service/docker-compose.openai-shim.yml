@@ -7,7 +7,7 @@
 # 启用（假设主服务已在宿主机 3000 端口发布）：
 #   docker compose -f docker-compose.openai-shim.yml up -d
 #
-# 客户端填：Base URL = http://127.0.0.1:8081/v1   API Key = 任意字符串
+# 客户端填：Base URL = http://127.0.0.1:8081/v1   API Key = 见 CLIENT_KEY
 name: summeretto-shim
 
 services:
@@ -25,6 +25,11 @@ services:
       # Linux 上 host.docker.internal 可能需补：
       #   extra_hosts: ["host.docker.internal:host-gateway"]
       UPSTREAM: "${UPSTREAM:-http://host.docker.internal:3000}"
+      # 桥调主服务时携带的凭据 = 主服务的 PROXY_API_KEY。
+      # 主服务开了鉴权时必须填，否则桥的所有上游调用都会被 401 打回。
+      UPSTREAM_KEY: "${UPSTREAM_KEY:-}"
+      # 要求客户端出示的密钥；留空 = 不校验客户端（仅适合单机自用）。
+      CLIENT_KEY: "${CLIENT_KEY:-}"
       # ★ 补偿上游空正文的重试。默认值来自一轮实测（见 OpenAI-compat.md「实测与调优」），
       #   **换网络 / 换账号 / 换时段后建议重新实测再定，不要照抄。**
       EMPTY_RETRY: "1"

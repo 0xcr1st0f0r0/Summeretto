@@ -40,6 +40,18 @@ const UPSTREAM = (process.env.UPSTREAM ?? "http://127.0.0.1:3000").replace(/\/+$
 const EMPTY_RETRY = Number(process.env.EMPTY_RETRY ?? 1);
 const EMPTY_RETRY_DELAY_MS = Number(process.env.EMPTY_RETRY_DELAY_MS ?? 500);
 
+// ── 鉴权 ────────────────────────────────────────────────────────────────
+// 上游若配置了 PROXY_API_KEY，则所有 /v1beta 路由都要带 key。
+// UPSTREAM_KEY：桥自己调上游时用的凭据（= 上游的 PROXY_API_KEY）。
+//   留空 = 上游未开鉴权，桥不注入任何 key。
+// CLIENT_KEY：桥要求客户端出示的凭据。
+//   留空 = 不校验客户端（仅适合单机自用）。
+//   设置后，客户端必须在 Authorization: Bearer / x-goog-api-key 里带上它。
+// ★ 两者独立：桥对上游用 UPSTREAM_KEY，对客户端用 CLIENT_KEY，
+//   这样「桥的出网凭据」不会因客户端乱填 API Key 而被打回。
+const UPSTREAM_KEY = String(process.env.UPSTREAM_KEY ?? "").trim();
+const CLIENT_KEY = String(process.env.CLIENT_KEY ?? "").trim();
+
 const H = {
   "content-type": "application/json; charset=utf-8",
   "access-control-allow-origin": "*",
@@ -118,13 +130,36 @@ function toGeminiBody(body) {
 
   for (const msg of body?.messages ?? []) {
     const role = String(msg?.role ?? "user").toLowerCase();
+
+    // ★ assistant 携带 tool_calls：转成 functionCall part。
+    //   原生侧（lib/gemini.js → toolPartToText）会把 functionCall part
+    //   转成 ```function_call 围栏文本，与模型约定的提示词格式对齐。
+    if (role === "assistant" && Array.isArray(msg?.tool_calls) && msg.tool_calls.length) {
+      const parts = toParts(msg?.content);
+      for (const tc of msg.tool_calls) {
+        const fn = tc?.function ?? tc;
+        if (!fn?.name) continue;
+        parts.push({ functionCall: { name: fn.name, args: parseArgs(fn.arguments) } });
+      }
+      contents.push({ role: "model", parts });
+      continue;
+    }
+
     const parts = toParts(msg?.content);
     if (!parts.length) continue;
 
     if (role === "system" || role === "developer") {
       systemParts.push(...parts);
     } else if (role === "tool" || role === "function") {
-      contents.push({ role: "user", parts });
+      // ★ 工具结果：原生侧把 functionResponse part 转成
+      //   "[Tool result for <name>]: <body>" 文本标记，模型据此续答。
+      //   OpenAI 侧 name 在 tool_call_id / name 字段上，取不到则用通用名。
+      const tName = msg?.name || msg?.tool_call_id || "tool";
+      const raw = typeof msg?.content === "string" ? msg.content : JSON.stringify(msg?.content ?? "");
+      contents.push({
+        role: "user",
+        parts: [{ text: `[Tool result for ${tName}]: ${raw}` }],
+      });
     } else {
       contents.push({ role: role === "assistant" ? "model" : "user", parts });
     }
@@ -135,6 +170,13 @@ function toGeminiBody(body) {
 
   const out = { contents };
   if (systemParts.length) out.systemInstruction = { parts: systemParts };
+
+  // ★ 工具声明：OpenAI → Gemini。转成原生形态后由原生侧统一做 prompt 仿真，
+  //   桥不重复实现那套逻辑（保持与原生链路逐字一致）。
+  const gTools = toGeminiTools(body?.tools);
+  if (gTools.length) out.tools = gTools;
+  const gToolCfg = toGeminiToolConfig(body?.tool_choice);
+  if (gToolCfg) out.toolConfig = gToolCfg;
 
   const gc = {};
   if (typeof body?.temperature === "number") gc.temperature = body.temperature;
@@ -148,6 +190,72 @@ function toGeminiBody(body) {
   return out;
 }
 
+/** OpenAI 的 arguments（JSON 字符串）→ Gemini functionCall.args（对象） */
+function parseArgs(raw) {
+  if (raw == null) return {};
+  if (typeof raw === "object") return raw;
+  const s = String(raw).trim();
+  if (!s) return {};
+  try {
+    const p = JSON.parse(s);
+    return typeof p === "object" && p !== null ? p : { value: p };
+  } catch {
+    return { value: raw };
+  }
+}
+
+/* ───────────────────── OpenAI tools → Gemini tools ───────────────────── */
+
+/**
+ * OpenAI 的 tools/function_call → Gemini 的 tools/functionDeclarations。
+ *
+ * ★ 为什么必须转：Robin 私有协议没有独立的工具声明通道，原生侧靠
+ *   lib/toolcall.js 做「prompt 仿真」（把声明序列化进提示词，再从模型
+ *   输出里解析 ```function_call 围栏回填）。若桥把 tools 直接丢掉，
+ *   模型会**静默凭自身知识编造答案**（实测问"北京天气"→编造 15°C 多云，
+ *   functionCall=0，全程无报错）——静默错误比响亮失败危险得多。
+ *
+ * OpenAI 形态有两种：
+ *   新式：{ type:"function", function:{ name, description, parameters } }
+ *   旧式：{ name, description, parameters }（直接平铺在 tool 上）
+ */
+function toGeminiTools(tools) {
+  const decls = [];
+  for (const t of Array.isArray(tools) ? tools : []) {
+    const fn = t?.type === "function" || t?.function ? t.function : t;
+    if (!fn?.name) continue;
+    const d = { name: fn.name, description: fn.description ?? "" };
+    const params = fn.parameters ?? fn.parametersJsonSchema;
+    if (params) d.parameters = params;
+    decls.push(d);
+  }
+  return decls.length ? [{ functionDeclarations: decls }] : [];
+}
+
+/**
+ * OpenAI 的 tool_choice → Gemini 的 toolConfig。
+ * · "none"            → mode: NONE
+ * · "required"/"any"  → mode: ANY
+ * · {type:"function",function:{name}} → mode: ANY + 白名单
+ * · "auto"/缺省       → AUTO（原生侧默认）
+ */
+function toGeminiToolConfig(toolChoice) {
+  if (toolChoice == null) return null;
+  if (typeof toolChoice === "string") {
+    const v = toolChoice.toLowerCase();
+    if (v === "none") return { functionCallingConfig: { mode: "NONE" } };
+    if (v === "required" || v === "any") return { functionCallingConfig: { mode: "ANY" } };
+    return null; // auto：原生侧默认 AUTO
+  }
+  const name = toolChoice?.function?.name ?? toolChoice?.name;
+  if (name) {
+    return {
+      functionCallingConfig: { mode: "ANY", allowedFunctionNames: [name] },
+    };
+  }
+  return null;
+}
+
 /** Gemini 响应 → OpenAI choices[] */
 function geminiToOpenAI(gem, model) {
   const cand = gem?.candidates?.[0];
@@ -157,6 +265,27 @@ function geminiToOpenAI(gem, model) {
     .join("")
     .trim();
   const u = gem?.usageMetadata ?? {};
+
+  // ★ functionCall part → OpenAI tool_calls。
+  //   原生侧（lib/app.js）已把模型输出的 ```function_call 围栏解析回填为
+  //   functionCall part，桥只需翻译成 OpenAI 的 tool_calls 结构。
+  const toolCalls = [];
+  for (const p of parts) {
+    const fc = p?.functionCall ?? p?.function_call;
+    if (!fc?.name) continue;
+    toolCalls.push({
+      id: `call_${Math.random().toString(36).slice(2, 12)}`,
+      type: "function",
+      function: { name: fc.name, arguments: JSON.stringify(fc.args ?? {}) },
+    });
+  }
+
+  const message = { role: "assistant", content };
+  if (toolCalls.length) {
+    message.content = content || null; // OpenAI 规范：有 tool_calls 时 content 可为 null
+    message.tool_calls = toolCalls;
+  }
+
   return {
     id: `chatcmpl-${Math.random().toString(36).slice(2, 12)}`,
     object: "chat.completion",
@@ -165,8 +294,8 @@ function geminiToOpenAI(gem, model) {
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content },
-        finish_reason: FINISH_MAP[cand?.finishReason] ?? "stop",
+        message,
+        finish_reason: toolCalls.length ? "tool_calls" : (FINISH_MAP[cand?.finishReason] ?? "stop"),
       },
     ],
     usage: {
@@ -180,7 +309,7 @@ function geminiToOpenAI(gem, model) {
 /* ─────────────────────────── 调用上游 ─────────────────────────── */
 
 /** 非流式调用（带空响应重试） */
-async function callUpstream(model, body, apiKey) {
+async function callUpstream(model, body) {
   const url = `${UPSTREAM}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
   let attempt = 0;
   let last = null;
@@ -188,7 +317,7 @@ async function callUpstream(model, body, apiKey) {
   while (attempt <= EMPTY_RETRY) {
     attempt++;
     const headers = { "content-type": "application/json" };
-    if (apiKey) headers["x-goog-api-key"] = apiKey;
+    if (UPSTREAM_KEY) headers["x-goog-api-key"] = UPSTREAM_KEY;
 
     const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
@@ -196,8 +325,13 @@ async function callUpstream(model, body, apiKey) {
 
     if (!r.ok) return last; // 上游明确报错，不重试
 
-    const text = (j?.candidates?.[0]?.content?.parts ?? []).map((p) => p?.text ?? "").join("");
-    if (text.trim()) return last;
+    const parts = j?.candidates?.[0]?.content?.parts ?? [];
+    const text = parts.map((p) => p?.text ?? "").join("");
+    // ★ 只有「既无正文、又无 functionCall」才算空响应。
+    //   工具模式下模型只返回 functionCall part 而 text 为空——那是正常应答，
+    //   若按空正文判定就会白白重试（把真正的工具调用当抖动丢掉）。
+    const hasToolCall = parts.some((p) => p?.functionCall ?? p?.function_call);
+    if (text.trim() || hasToolCall) return last;
     // 空正文：上游抖动（实测 1/3 左右概率）。必须带延迟重试——
     // 立刻重试会打在同一个坏后端上，等于没重试。
     if (attempt <= EMPTY_RETRY) await sleep(EMPTY_RETRY_DELAY_MS);
@@ -218,9 +352,16 @@ const MODEL_TTL = 60_000;
 async function listModels() {
   if (modelCache.data && Date.now() - modelCache.at < MODEL_TTL) return modelCache.data;
 
+  // 上游的 /v1beta/models 同样受 PROXY_API_KEY 保护，必须带凭据
+  const headers = {};
+  if (UPSTREAM_KEY) headers["x-goog-api-key"] = UPSTREAM_KEY;
+
   let r;
   try {
-    r = await fetch(`${UPSTREAM}/v1beta/models`, { signal: AbortSignal.timeout(8000) });
+    r = await fetch(`${UPSTREAM}/v1beta/models`, {
+      headers,
+      signal: AbortSignal.timeout(8000),
+    });
   } catch (err) {
     if (modelCache.data) {
       console.warn(`[openai-shim] 上游不可达（${err?.message}），返回过期缓存`);
@@ -243,10 +384,10 @@ async function listModels() {
 
 /* ─────────────────────────── 流式转发 ─────────────────────────── */
 
-async function streamChat(req, res, model, body, apiKey) {
+async function streamChat(req, res, model, body) {
   const url = `${UPSTREAM}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
   const headers = { "content-type": "application/json" };
-  if (apiKey) headers["x-goog-api-key"] = apiKey;
+  if (UPSTREAM_KEY) headers["x-goog-api-key"] = UPSTREAM_KEY;
 
   const up = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
   if (!up.ok || !up.body) {
@@ -280,6 +421,7 @@ async function streamChat(req, res, model, body, apiKey) {
   const decoder = new TextDecoder();
   let buf = "";
   let closed = false;
+  let sawToolCall = false; // 本次流里是否出现过 functionCall（决定 finish_reason）
 
   try {
     while (!closed) {
@@ -304,9 +446,27 @@ async function streamChat(req, res, model, body, apiKey) {
           }
           const text = (j?.candidates?.[0]?.content?.parts ?? []).map((p) => p?.text ?? "").join("");
           if (text) emit({ content: text });
+          // ★ 流式里的 functionCall part → OpenAI tool_calls delta
+          const fcs = (j?.candidates?.[0]?.content?.parts ?? [])
+            .filter((p) => p?.functionCall ?? p?.function_call)
+            .map((p) => {
+              const fc = p.functionCall ?? p.function_call;
+              return {
+                index: 0,
+                id: `call_${Math.random().toString(36).slice(2, 12)}`,
+                type: "function",
+                function: { name: fc.name, arguments: JSON.stringify(fc.args ?? {}) },
+              };
+            });
+          if (fcs.length) {
+            sawToolCall = true;
+            emit({ tool_calls: fcs });
+          }
           const fr = j?.candidates?.[0]?.finishReason;
           if (fr) {
-            emit({}, FINISH_MAP[fr] ?? "stop");
+            // ★ 用累积标志而非本帧的 fcs：functionCall 在前帧、finishReason 在后帧时，
+            //   本帧 fcs 为空，会把 finish_reason 误报成 stop。
+            emit({}, sawToolCall ? "tool_calls" : (FINISH_MAP[fr] ?? "stop"));
             closed = true;
           }
         }
@@ -326,7 +486,8 @@ async function streamChat(req, res, model, body, apiKey) {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const path = url.pathname.replace(/\/+$/, "") || "/";
-  const apiKey =
+  // 客户端出示的凭据（仅用于校验客户端身份，不透传给上游）
+  const clientKey =
     req.headers["x-goog-api-key"] ??
     String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "") ??
     "";
@@ -334,6 +495,13 @@ const server = createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, H);
     return res.end();
+  }
+
+  // ── 客户端鉴权 ──
+  // CLIENT_KEY 留空 = 不校验（单机自用）；设置后必须出示匹配的凭据。
+  // /healthz 不参与鉴权：它是容器健康检查与诊断入口。
+  if (CLIENT_KEY && path !== "/healthz" && clientKey !== CLIENT_KEY) {
+    return sendErr(res, 401, "API key missing or invalid", "authentication_error");
   }
 
   try {
@@ -363,9 +531,9 @@ const server = createServer(async (req, res) => {
       const model = normalizeModel(body?.model);
       const geminiBody = toGeminiBody(body);
 
-      if (body?.stream) return await streamChat(req, res, model, geminiBody, apiKey);
+      if (body?.stream) return await streamChat(req, res, model, geminiBody);
 
-      const { status, json } = await callUpstream(model, geminiBody, apiKey);
+      const { status, json } = await callUpstream(model, geminiBody);
       if (status !== 200) {
         return sendErr(res, status, json?.error?.message ?? "上游调用失败", "upstream_error");
       }
@@ -383,5 +551,11 @@ server.listen(PORT, HOST, () => {
   console.log(`[openai-shim] 已启动  http://${HOST}:${PORT}/v1`);
   console.log(`[openai-shim] 上游    ${UPSTREAM}（Gemini 原生）`);
   console.log(`[openai-shim] 空响应重试 ${EMPTY_RETRY} 次`);
+  console.log(
+    `[openai-shim] 鉴权    客户端 ${CLIENT_KEY ? "已开启（需携带 API Key）" : "未开启（任何人可调用）"}`,
+  );
+  console.log(
+    `[openai-shim] 上游凭据 ${UPSTREAM_KEY ? "已配置（UPSTREAM_KEY）" : "未配置（上游应无鉴权）"}`,
+  );
   console.log(`[openai-shim] 客户端 Base URL 填： http://${HOST}:${PORT}/v1`);
 });
