@@ -891,6 +891,13 @@ ok("★ 幂等去重闭环（同 payload 重发 ⇒ 零上游调用；新意图�
   for (const panel of ["存活信息", "会话信息（HTTP/2）", "额度信息", "心跳测试", "最近日志"]) {
     assert.ok(html4.includes(panel), `仪表盘应含「${panel}」面板`);
   }
+  // 面板顺序：额度 → 存活 → 会话 → 心跳 → 日志（单列全宽布局）
+  const order = ["额度信息", "存活信息", "会话信息（HTTP/2）", "心跳测试", "最近日志"].map((p) =>
+    html4.indexOf(p),
+  );
+  assert.ok(order.every((i) => i >= 0), "五个面板都应存在");
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), "面板顺序应为 额度→存活→会话→心跳→日志");
+  assert.ok(!html4.includes("运行时开关"), "运行时开关面板已移除");
   const r5 = await fetch(`${base}/admin/api/state`, { headers: { cookie: ck } });
   assert.equal(r5.status, 200);
   const st = await r5.json();

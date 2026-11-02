@@ -124,7 +124,14 @@ export function adminState() {
       heapTotalMb: Math.round((mem.heapTotal / 1048576) * 10) / 10,
     },
     auth: ts.source !== "none" ? ts.source : "missing",
-    credential: { ...cred, ...ts.gpsoauth },
+    // ★ expiresInSec 与账号邮箱原本只散在 tokenStatus() 里，后台要用却拿不到
+    //   —— 这里显式并进 credential，避免面板显示「—」与「未绑定账号」。
+    credential: {
+      ...cred,
+      ...ts.gpsoauth,
+      expiresInSec: ts.expiresInSec ?? null,
+      account: ts.account ?? null,
+    },
     inflight: inflightStatus(),
     dedup: dedupStatus(),
     emptyRetry: emptyRetryStatus(),
