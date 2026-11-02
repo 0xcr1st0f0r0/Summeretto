@@ -29,6 +29,10 @@ process.env.ADMIN_KEY = "e2e-admin-key";
 // 限流是防扫薅的 best-effort 机制，e2e 不测它（整套跑下来请求数本就逼近 30/min 默认值，
 // 会把正常用例误判成 429）。这里显式放开，专注验证去重/重试/降级等逻辑本身。
 process.env.RATE_LIMIT_MAX = "100000";
+// ★ issue #4 回归用：把「上游真空」的快速失败宽限压到 1s（默认 10s），
+//   否则「服务端一个字节都不回」的用例要干等 10s。正常用例不受影响
+//   （mock 5ms 内就应答，idle 定时器根本不会触发）。
+process.env.ROBIN_IDLE_MS = "1000";
 
 const { handle } = await import("../lib/app.js");
 const { guardStatus, __resetGuardForTest } = await import("../lib/degrade-guard.js");
@@ -804,6 +808,123 @@ ok("★ 幂等去重闭环（同 payload 重发 ⇒ 零上游调用；新意图�
   assert.equal(h1.emptyRetry.exhausted - h0.emptyRetry.exhausted, 1, "应记录 1 次耗尽");
   assert.equal(h1.emptyRetry.successes - h0.emptyRetry.successes, 0, "不应有成功");
   ok("§17.2 连续空响应 → 2 次尝试后放弃（不拖过预算；healthz 记账）");
+}
+
+/* 19. ★ issue #4 回归：上游真空 → HTTP/2 会话被毒化销毁 → 后续请求重建连接并恢复
+ *
+ *   issue #4 实证的症状：一次「上游真空」后，客户端继续复用那条半死连接，
+ *   后续**所有**请求都是 frames=0（「【A 上游真空】未收到任何帧」），持续上千次
+ *   且不会自愈，只有 docker restart 能恢复。
+ *
+ *   mock 侧：TRIGGER_VACUUM 让**当前这条连接**从此不响应（真实模拟「TCP 半死」：
+ *   连接还在、请求也送到了，但服务端一个字节都不回）；新建连接则正常应答。
+ *   ⇒ 未修复时，第二个请求会复用半死连接 → 同样 frames=0 → 本用例失败。
+ *   ⇒ 修复后，客户端在真空请求结束时 destroy 该会话 → 第二个请求重建连接 → 成功。 */
+{
+  const connBefore = seen.connections;
+
+  // ① 真空请求：mock 挂起不响应 → 客户端 idle 超时 → frames=0（空正文）
+  const r1 = await fetch(`${base}/v1beta/models/gemini-4-argon:generateContent`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "TRIGGER_VACUUM 触发半死连接" }] }] }),
+  });
+  assert.equal(r1.status, 200, "真空请求应返回（空）响应而不报错");
+  const t1 = (await r1.json()).candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+  assert.equal(t1, "", "真空请求应为空正文（上游一个字节都没回）");
+
+  // ② 随后的普通请求必须走**新连接**并成功
+  const r2 = await fetch(`${base}/v1beta/models/gemini-4-argon:generateContent`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "真空之后恢复正常" }] }] }),
+  });
+  assert.equal(r2.status, 200);
+  const t2 = (await r2.json()).candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+  assert.ok(t2.includes("真空之后恢复正常"), `毒化后应恢复应答，实际：${JSON.stringify(t2)}`);
+  assert.ok(
+    seen.connections > connBefore,
+    `毒化后必须重建连接（连接数 ${connBefore} → ${seen.connections}）`,
+  );
+  ok("§19 上游真空 → 会话被销毁 → 后续请求重建连接并恢复（issue #4 回归）");
+}
+
+/* 20. ★ /admin 后台：登录 → 签名 Cookie → 状态 / 日志 / 心跳
+ *
+ *   鉴权模型：页面登录后拿到的是 **HMAC 签名 Cookie**（HttpOnly，密钥 = ADMIN_KEY），
+ *   ADMIN_KEY 本身不落前端；脚本场景仍可用 x-admin-key 头（向后兼容）。 */
+{
+  // ① 未登录 → 给登录表单
+  const r0 = await fetch(`${base}/admin`);
+  assert.equal(r0.status, 200);
+  const html0 = await r0.text();
+  assert.ok(html0.includes("请输入 Admin Key"), "未登录应给登录表单");
+  assert.ok(!html0.includes("存活信息"), "未登录不应泄露仪表盘内容");
+
+  // ② 未授权 / 错 key → 401
+  assert.equal((await fetch(`${base}/admin/api/state`)).status, 401, "未授权应 401");
+  const r2 = await fetch(`${base}/admin/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key: "wrong-key" }),
+  });
+  assert.equal(r2.status, 401, "错 key 应 401");
+
+  // ③ 正确 key → 200 + 签名 Cookie（HttpOnly）
+  const r3 = await fetch(`${base}/admin/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key: "e2e-admin-key" }),
+  });
+  assert.equal(r3.status, 200, "正确 key 应 200");
+  const cookieHeaders = r3.headers.getSetCookie?.() ?? [r3.headers.get("set-cookie")];
+  const cookie = cookieHeaders.find((c) => c && c.startsWith("summeretto_admin="));
+  assert.ok(cookie, "应下发签名 Cookie");
+  assert.ok(cookie.includes("HttpOnly"), "Cookie 应为 HttpOnly");
+  assert.ok(cookie.includes("SameSite=Strict"), "Cookie 应为 SameSite=Strict");
+  const ck = cookie.split(";")[0];
+
+  // ④ 带 Cookie → 仪表盘 + 状态 API
+  const r4 = await fetch(`${base}/admin`, { headers: { cookie: ck } });
+  assert.equal(r4.status, 200);
+  const html4 = await r4.text();
+  for (const panel of ["存活信息", "会话信息（HTTP/2）", "额度信息", "心跳测试", "最近日志"]) {
+    assert.ok(html4.includes(panel), `仪表盘应含「${panel}」面板`);
+  }
+  // 面板顺序：额度 → 存活 → 会话 → 心跳 → 日志（单列全宽布局）
+  const order = ["额度信息", "存活信息", "会话信息（HTTP/2）", "心跳测试", "最近日志"].map((p) =>
+    html4.indexOf(p),
+  );
+  assert.ok(order.every((i) => i >= 0), "五个面板都应存在");
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), "面板顺序应为 额度→存活→会话→心跳→日志");
+  assert.ok(!html4.includes("运行时开关"), "运行时开关面板已移除");
+  const r5 = await fetch(`${base}/admin/api/state`, { headers: { cookie: ck } });
+  assert.equal(r5.status, 200);
+  const st = await r5.json();
+  assert.ok(st.ok, "状态应 ok");
+  assert.ok(st.session && typeof st.session.alive === "boolean", "状态应含 session 段");
+  assert.ok(st.credential && st.credential.verdict, "状态应含 credential 判定");
+
+  // ⑤ 日志 API（环形缓冲）
+  const r6 = await fetch(`${base}/admin/api/logs?limit=10`, { headers: { cookie: ck } });
+  assert.equal(r6.status, 200);
+  const lg = await r6.json();
+  assert.ok(Array.isArray(lg.entries), "日志应返回数组");
+  assert.ok(lg.buffer && lg.buffer.enabled, "日志缓冲应已启用");
+
+  // ⑥ 心跳：PING 层必须通（mock 是 h2c，支持 PING）
+  const r7 = await fetch(`${base}/admin/api/heartbeat`, { method: "POST", headers: { cookie: ck } });
+  assert.equal(r7.status, 200);
+  const hb = await r7.json();
+  assert.ok(hb.ping && typeof hb.ping.ok === "boolean", "心跳应含 ping 段");
+  assert.equal(hb.ping.ok, true, `PING 应成功，实际：${hb.ping.error}`);
+
+  // ⑦ 退出 → Cookie 失效，API 回到 401
+  const r8 = await fetch(`${base}/admin/logout`, { method: "POST", headers: { cookie: ck } });
+  assert.equal(r8.status, 200);
+  assert.equal((await fetch(`${base}/admin/api/state`, { headers: { cookie: ck } })).status, 401, "退出后应失效");
+
+  ok("§20 /admin 后台：登录 → 签名 Cookie → 状态/日志/心跳 → 退出失效");
 }
 
 app.close();
