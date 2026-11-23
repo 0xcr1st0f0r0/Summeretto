@@ -7,6 +7,20 @@ import { buildTextQueryScript } from "./pq.js";
 import { processQuery, deleteConversation } from "./robin.js";
 import { tokenStatus, setInjectedToken, bindGpsoauth, mintAccessToken, credentialHealth } from "./auth.js";
 import { renderLoginPage } from "./login-page.js";
+import { installLogBuffer } from "./log-buffer.js";
+import { renderAdminPage } from "./admin-page.js";
+import {
+  adminAuthed,
+  adminEnabled,
+  adminState,
+  adminLogs,
+  runHeartbeat,
+  runUsageQuery,
+  issueAdminCookie,
+  revokeAdminCookies,
+  ADMIN_COOKIE_NAME,
+  ADMIN_COOKIE_MAX_AGE_S,
+} from "./admin-api.js";
 import { geminiToRobin, makeGeminiResponse, makeGeminiChunk, makeGeminiFunctionCallChunk, sseData, geminiError, encodeFileUri, decodeFileUri } from "./gemini.js";
 import { estimatePromptTokens, withEstimatedUsage } from "./usage-estimate.js";
 import { hasToolDeclarations, extractToolDefs, parseFunctionCalls } from "./toolcall.js";
@@ -91,17 +105,22 @@ function sendHtml(res, status, html) {
   res.end(body);
 }
 
-/** admin 端点统一鉴权；返回 true 表示已放行 */
+// ★ 尽早装日志环形缓冲（/admin 后台的「最近日志」面板读它）。
+//   装在 app.js 而非 server.mjs：任何处理请求的入口都从这里 import，
+//   Vercel（server.mjs）与离线 e2e（直接引 app.js）都自动覆盖。
+//   只抄不拦：stdout 日志一行不差地照常输出。
+installLogBuffer();
+
+/** admin 端点统一鉴权；返回 true 表示已放行
+ *  ★ 后台页面用**签名 Cookie**（HMAC，密钥 = ADMIN_KEY），脚本仍可用 x-admin-key 头。 */
 function adminAllowed(req, res) {
   if (!config.adminKey) {
     sendError(res, 404, "admin 端点未启用（未配置 ADMIN_KEY）", "NOT_FOUND");
     return false;
   }
-  if (req.headers["x-admin-key"] !== config.adminKey) {
-    sendError(res, 401, "admin key 无效", "UNAUTHENTICATED");
-    return false;
-  }
-  return true;
+  if (adminAuthed(req)) return true;
+  sendError(res, 401, "admin key 无效", "UNAUTHENTICATED");
+  return false;
 }
 
 function authed(req) {
@@ -487,6 +506,84 @@ export async function handle(req, res) {
     // POST /admin/gpsoauth?action=mint → 强制用 master token 重取一个访问令牌
     if (path === "/login" && req.method === "GET") {
       sendHtml(res, 200, renderLoginPage({ adminEnabled: Boolean(config.adminKey) }));
+      return;
+    }
+
+    // ── ★ /admin 后台管理页（2026-11-02）───────────────────────────────
+    //   GET  /admin              → 后台页（未登录给登录表单，已登录给仪表盘）
+    //   POST /admin/login         → 校验 Admin Key，下发**签名 Cookie**（HttpOnly）
+    //   POST /admin/logout        → 清除 Cookie
+    //   GET  /admin/api/state     → 状态聚合（只读，不发推理请求）
+    //   GET  /admin/api/logs      → 最近日志（进程内环形缓冲）
+    //   POST /admin/api/heartbeat → 心跳测试（PING + GetUserStatus 两层）
+    //   POST /admin/api/usage     → 额度查询（走独立 CLI，不把它的模块引进来）
+    if (path === "/admin" && req.method === "GET") {
+      sendHtml(res, 200, renderAdminPage({ authenticated: adminAuthed(req) }));
+      return;
+    }
+
+    if (path === "/admin/login" && req.method === "POST") {
+      if (!adminEnabled()) {
+        sendError(res, 404, "admin 端点未启用（未配置 ADMIN_KEY）", "NOT_FOUND");
+        return;
+      }
+      let body;
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch {
+        sendError(res, 400, "请求体不是合法 JSON", "INVALID_ARGUMENT");
+        return;
+      }
+      if (!body?.key || body.key !== config.adminKey) {
+        sendError(res, 401, "admin key 无效", "UNAUTHENTICATED");
+        return;
+      }
+      const payload = Buffer.from(JSON.stringify({ ok: true }), "utf8");
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": payload.length,
+        "cache-control": "no-store",
+        "set-cookie": `${ADMIN_COOKIE_NAME}=${encodeURIComponent(issueAdminCookie())}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${ADMIN_COOKIE_MAX_AGE_S}`,
+      });
+      res.end(payload);
+      return;
+    }
+
+    if (path === "/admin/logout" && req.method === "POST") {
+      revokeAdminCookies(); // ★ 作废已签发的 Cookie（否则手工重放旧 Cookie 仍可用）
+      const payload = Buffer.from(JSON.stringify({ ok: true }), "utf8");
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": payload.length,
+        "cache-control": "no-store",
+        "set-cookie": `${ADMIN_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`,
+      });
+      res.end(payload);
+      return;
+    }
+
+    if (path === "/admin/api/state" && req.method === "GET") {
+      if (!adminAllowed(req, res)) return;
+      sendJson(res, 200, adminState());
+      return;
+    }
+
+    if (path === "/admin/api/logs" && req.method === "GET") {
+      if (!adminAllowed(req, res)) return;
+      const limit = Number(url.searchParams.get("limit") ?? 200);
+      sendJson(res, 200, adminLogs(limit));
+      return;
+    }
+
+    if (path === "/admin/api/heartbeat" && req.method === "POST") {
+      if (!adminAllowed(req, res)) return;
+      sendJson(res, 200, await runHeartbeat());
+      return;
+    }
+
+    if (path === "/admin/api/usage" && req.method === "POST") {
+      if (!adminAllowed(req, res)) return;
+      sendJson(res, 200, await runUsageQuery());
       return;
     }
 

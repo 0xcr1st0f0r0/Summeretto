@@ -156,6 +156,27 @@ export const config = {
   robinIdleAfterTextMs: Math.max(1_000, Number(process.env.ROBIN_IDLE_AFTER_TEXT_MS ?? 30_000)),
   robinIdleFirstMs: Math.min(300_000, Math.max(1_000, Number(process.env.ROBIN_IDLE_FIRST_MS ?? 300_000))),
 
+  // ── ★ HTTP/2 会话健康与轮换（2026-11-02，修 issue #4）────────────────────
+  //   症状：长期运行后偶发一次总时限超时或网络丢包，随后**所有**请求都陷入
+  //     「【A 上游真空】未收到任何帧」（frames=0），持续上千次且**不会自愈**，
+  //     只有 docker restart 能恢复。
+  //   根因：HTTP/2 单例 Session 遇到「TCP 半死」（NAT / 透明代理静默丢包，
+  //     收不到 FIN/RST）时，Node 侧既不 closed 也不 destroyed ⇒ getSession()
+  //     继续复用这条死连接 ⇒ 新 stream 上的数据送不到服务端，收不到任何 ACK 帧。
+  //   对策（见 lib/robin.js）：
+  //     ① 毒化：请求结束时若「一个字节都没收到」⇒ destroy 该会话，下次重新握手
+  //     ② 轮换：按最大存活时长 / 最大复用次数主动换连接（防 stream ID 耗尽）
+  //     ③ 心跳：空闲时定期 ping 探活，ping 不回即判定半死并销毁
+  //
+  //   ROBIN_SESSION_MAX_AGE_MS      会话最大存活时长（0 = 不限）
+  //   ROBIN_SESSION_MAX_REQUESTS    单会话最大复用次数（0 = 不限）
+  //   ROBIN_SESSION_PING_IDLE_MS     心跳间隔（0 = 关闭心跳）
+  //   ROBIN_SESSION_PING_TIMEOUT_MS  心跳无回应的判定超时
+  robinSessionMaxAgeMs: Math.max(0, Number(process.env.ROBIN_SESSION_MAX_AGE_MS ?? 1_800_000)),
+  robinSessionMaxRequests: Math.max(0, Number(process.env.ROBIN_SESSION_MAX_REQUESTS ?? 500)),
+  robinSessionPingIdleMs: Math.max(0, Number(process.env.ROBIN_SESSION_PING_IDLE_MS ?? 30_000)),
+  robinSessionPingTimeoutMs: Math.max(1_000, Number(process.env.ROBIN_SESSION_PING_TIMEOUT_MS ?? 10_000)),
+
   // ★ .env 路径（供 auth.js 在 /login 绑定成功后把新master token 落盘）。
   //   不落盘的代价：绑定只活在进程内存里，一重启就退回 .env 里的旧 token，
   //   而那个通常已失效 ⇒ 表现为「刚绑定成功、一重启又 auth-failure」。

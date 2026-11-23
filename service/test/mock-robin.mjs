@@ -118,11 +118,21 @@ export function extractRequestModeId(payload) {
 export function startMockRobin({ port = 0, chunks, delayMs = 5 } = {}) {
   const server = http2.createServer();
   const seen = { requests: 0, lastText: null, lastFrameCount: 0, lastAttachments: [], lastEnvelope: null,
-    lastModeId: null, lastModeCarriers: { field1: null, envelope: null }, modeHistory: [] };
+    lastModeId: null, lastModeCarriers: { field1: null, envelope: null }, modeHistory: [],
+    // ★ 连接计数（2026-11-02，修 issue #4）：会话被毒化后客户端应重新握手 ⇒ 此值 +1
+    connections: 0 };
   /** TRIGGER_EMPTY 命中计数（第 1 次空、第 2 次起正常；见下方注入块） */
   const emptyProbe = { n: 0 };
   /** TRIGGER_EMPTY_ALWAYS 命中计数（恒空；供「重试耗尽」闭环测试） */
   const emptyAlwaysProbe = { n: 0 };
+
+  // ★ 统计 TCP/HTTP2 连接数 —— 会话毒化与轮换的观测点
+  server.on("session", (s) => {
+    seen.connections++;
+    // ★ 该连接是否已被「毒化」（半死）：毒化后它上面的一切请求都不再响应，
+    //   逼客户端必须重建连接 —— 这才是 issue #4 的真实形态。
+    s.__poisoned = false;
+  });
 
   server.on("stream", (stream, headers) => {
     const path = String(headers[":path"] ?? "");
@@ -133,6 +143,10 @@ export function startMockRobin({ port = 0, chunks, delayMs = 5 } = {}) {
     }
     const dec = new GrpcFrameDecoder();
     let replied = false;
+
+    // ★ 半死连接模拟（2026-11-02，修 issue #4）：该连接已被毒化 ⇒ 一律不响应。
+    //   未修复时客户端会继续复用它 → 后续请求全量 frames=0（issue 的真实症状）。
+    if (stream.session?.__poisoned) return;
 
     stream.on("data", (c) => {
       const frames = dec.push(c);
@@ -146,6 +160,18 @@ export function startMockRobin({ port = 0, chunks, delayMs = 5 } = {}) {
       seen.lastModeCarriers = extractRequestModeCarriers(frames[0].payload);
       seen.lastModeId = seen.lastModeCarriers.envelope ?? seen.lastModeCarriers.field1 ?? null;
       seen.modeHistory.push(seen.lastModeId);
+
+      // ★ 真空注入（2026-11-02，修 issue #4）：文本含 TRIGGER_VACUUM 时
+      //   **完全不响应**（不 respond、不发 trailers），模拟 issue #4 里的「TCP 半死」：
+      //   连接还在、请求也送到了，但服务端一个字节都不回 ⇒ 客户端 frames=0。
+      //   与 TRIGGER_EMPTY 的区别：那个会回 200 + trailers（连接是好的），
+      //   这个什么都不回（连接已废）—— 正是需要被毒化的那种。
+      const isVacuum = String(seen.lastText ?? "").includes("TRIGGER_VACUUM");
+      if (isVacuum) {
+        // ★ 这条连接从此半死：后续落在它上面的请求也不再有响应
+        if (stream.session) stream.session.__poisoned = true;
+        return; // 故意悬着不响应，让客户端走 idle 超时
+      }
 
       // 空响应注入（2026-10-16）：文本含 TRIGGER_EMPTY 时，第 1 次请求返回「空响应」
       //   （无数据帧、无元数据；HTTP 200 + grpc-status 0 —— 对齐上游偶发空响应的响应面），

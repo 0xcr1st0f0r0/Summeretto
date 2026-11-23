@@ -86,6 +86,14 @@ http://127.0.0.1:3000/login
 ```
 按照内置的简洁网页引导完成一次 Google 账号授权，系统会自动帮你铸造出长效的 `GSA_MASTER_TOKEN` 并自动回写落盘到 `.env` 中。后续服务端会自动管理和刷新短期访问令牌。
 
+管理后台（可选，需配置 `ADMIN_KEY`）：
+```
+http://127.0.0.1:3000/admin
+```
+输入 Admin Key 进入，一屏看完**存活状态、账号剩余额度、心跳测试、HTTP/2 会话与最近日志**。
+登录后由服务端下发签名 Cookie（HttpOnly），页面不保存 Admin Key。
+详见 [service/README.md §十一](service/README.md)。
+
 ### 3. 验证服务状态
 
 使用 `curl` 检查服务是否就绪：
@@ -180,7 +188,8 @@ Summeretto 内部每 10 分钟自动与上游同步一次真实档位表：
 ```text
 1. 客户端没收到，绝不代表上游没扣费！
 2. 掐断网络连接，只是断了接收的耳朵，上游算力的齿轮依然在转动。
-3. 任何重启操作之前，必须检查 /healthz 中的 inflight 计数；只要大于 0，必须等待歌者唱完。
+3. 任何重启操作之前，必须检查 /healthz 中的 inflight 计数；**大于 1** 必须等待歌者唱完
+   （该计数含本次探测自身，静止时恒为 1，真实在途数 = inflight - 1）。
 ```
 
 * **防线一**：`lib/dedup.js` —— 90 秒滑动窗口内逐字节对比，若发现重复请求直接重放上次缓存流，**零上游调用**。
@@ -276,9 +285,11 @@ WantedBy=multi-user.target
 
 ```bash
 # 重启前检查是否有正在歌唱的在途请求
+# ⚠️ /healthz 的 inflight **含本次探测自身**（探测也是一个请求），
+#    故静止时恒为 1 —— 真实在途数 = inflight - 1。判据是「> 1 才算有在途」。
 curl -s http://127.0.0.1:3000/healthz | python3 -c \
   "import sys,json; d=json.load(sys.stdin); \
-   assert d['inflight']['inflight']==0, '尚有在途请求未完成，切勿强行重启！'; \
+   assert d['inflight']['inflight']<=1, '尚有在途请求未完成，切勿强行重启！'; \
    print('安全，可以重启')"
 
 sudo systemctl restart summeretto
@@ -295,6 +306,8 @@ sudo systemctl restart summeretto
 cd service
 docker compose up -d --build
 ```
+
+容器内同样提供 `/login` 与 `/admin` 两个页面（`ADMIN_KEY` 需自行配置）。
 
 完整构建、运行与持久化说明见 **[`service/Docker.md`](service/Docker.md)**。
 

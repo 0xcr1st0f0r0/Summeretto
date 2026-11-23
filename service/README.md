@@ -469,7 +469,108 @@ Lgaaz { #1 STRING conversationId, #2 Lgauy }   ← protoreach 反推，字段号
 
 ---
 
-## 十、路线图
+## 十、★ HTTP/2 会话「半死」与自愈（2026-11-02，修 issue #4）
+
+### 10.1 症状
+
+长期运行后偶发一次总时限超时或网络短暂丢包，随后**所有**后续请求全量陷入
+「【A 上游真空】未收到任何帧」（`frames=0`），连续上千次且**不会自愈**；
+账号与凭证完全正常，只有 `docker restart` 能恢复（issue #4 实证：累计 1100+ 次）。
+
+### 10.2 根因
+
+`lib/robin.js` 的 HTTP/2 连接是**模块级单例**，四重问题叠加：
+
+1. `getSession()` 仅以 `!session.closed && !session.destroyed` 判定可用；
+2. 超时 / 取消时执行的是 `stream.close(NGHTTP2_CANCEL)` —— 只关 **stream**，不销毁 **session**；
+3. 跨国链路 / NAT / 透明代理静默丢包（收不到 TCP FIN/RST）时，Node 侧不认为 session 已销毁，
+   于是继续复用这条**半死连接**：新 stream 的数据送不到服务端，收不到任何 ACK 帧；
+4. `closeRobinSession()` 虽已导出，但运行时**从未被调用**。
+
+⇒ 一个请求踩坑后，这条连接会毒化后续**全部**请求，形成不会自愈的死循环。
+
+### 10.3 修复：三道防线
+
+| 防线 | 手段 | 触发点 |
+|---|---|---|
+| ① **毒化** | 请求结束时若「一个字节都没收到」⇒ `session.destroy()`（**不是 close**：半死连接上 close 无效），下次请求重新握手 | `frames===0` **且**未收到 grpc-status |
+| ② **轮换** | 按最大存活时长 / 最大复用次数主动换连接（`close()` 发 GOAWAY，让在途请求自然收尾） | 每次取用会话时检查阈值 |
+| ③ **心跳** | 空闲时定期 `session.ping()` 探活；ping 无回应即判定半死并销毁 | 后台定时器（unref，不阻止进程退出） |
+
+**判据为什么是「frames===0 且没有 grpc-status」**：服务端若正常回了 trailers
+（`grpc-status=0`）只是正文为空，那条连接是好的，不该销毁；而 issue #4 的真空场景
+是一个字节都不回、连 trailers 都没有 —— 这才是会话级故障。
+
+> 修复效果：原先「一次踩坑 → 1100+ 次空回复 → 只能重启」，
+> 现在变成「**至多 1 次空回复**，下一次请求自动重连恢复」。
+
+### 10.4 配置项
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `ROBIN_SESSION_MAX_AGE_MS` | `1800000` | 会话最大存活时长（0 = 不限） |
+| `ROBIN_SESSION_MAX_REQUESTS` | `500` | 单会话最大复用次数（0 = 不限） |
+| `ROBIN_SESSION_PING_IDLE_MS` | `30000` | 心跳间隔（0 = 关闭心跳） |
+| `ROBIN_SESSION_PING_TIMEOUT_MS` | `10000` | 心跳无回应的判定超时 |
+
+### 10.5 回归测试
+
+`test/e2e.mjs §19`：mock 的 `TRIGGER_VACUUM` 会让**当前那条连接**从此不响应
+（真实模拟「TCP 半死」；新建连接则正常应答），断言：
+
+1. 真空请求返回空正文；
+2. **随后一个普通请求必须建立新连接并成功应答**；
+3. 连接计数递增。
+
+反向验证：注释掉毒化逻辑后本用例**必然失败**（第二个请求复用半死连接 → 空响应），
+确保它是一条真回归测试，而非恒过的摆设。
+
+---
+
+## 十一、★ 后台管理页（`/admin`）
+
+自包含的管理后台（零外部资源，单文件 HTML），把运维要盯的东西收在一处。
+
+| 面板 | 内容 |
+|---|---|
+| **存活信息** | 服务 / 上游 / 凭证判定（valid·stale·expired）/ 令牌剩余 / 在途请求 / 内存 |
+| **会话信息** | HTTP/2 会话：存活状态、已存活时长、本连接请求数、**毒化 / 轮换次数**（§十的三道防线状态） |
+| **额度信息** | 账号剩余额度（5 小时窗口 / 周窗口）+ 重置时间（走 `GetUsageInfo`） |
+| **心跳测试** | ① PING 探传输层存活（半死连接只有它能暴露）② GetUserStatus 端到端（令牌 + 上游） |
+| **运行时开关** | 入站上限、附件上限、会话隔离、限流、总时限、凭证落盘 |
+| **最近日志** | 进程日志环形缓冲（内存，300 条；重启即清空） |
+
+### 鉴权模型
+
+- **登录**：输入 `ADMIN_KEY` → 服务端下发 **HMAC-SHA256 签名 Cookie**
+  （`HttpOnly` + `SameSite=Strict` + 12h 时效）—— **ADMIN_KEY 本身不落前端**，页面 JS 也读不到 Cookie。
+- **退出**：`POST /admin/logout` → 服务端**作废**已签发的 Cookie（不只是让浏览器删），
+  手工重放旧 Cookie 会立刻 401。
+- **向后兼容**：所有 admin 端点仍接受 `x-admin-key` 请求头（脚本 / curl 场景不受影响）。
+- 未配置 `ADMIN_KEY` 时，`/admin` 与全部 admin 端点整体关闭（404）。
+
+### 端点
+
+```
+GET  /admin                后台页（未登录给登录表单，已登录给仪表盘）
+POST /admin/login          {key} → 下发签名 Cookie
+POST /admin/logout         作废当前会话
+GET  /admin/api/state      状态聚合（只读，不发推理请求）
+GET  /admin/api/logs       最近日志（?limit=200）
+POST /admin/api/heartbeat  心跳测试（PING + GetUserStatus 两层）
+POST /admin/api/usage      额度查询
+```
+
+### 两个刻意的设计取舍
+
+1. **额度查询走独立子进程**（`optional/usage-info/query.mjs --enable`），不把它的模块
+   import 进网关 —— 那个 CLI 明确「never imported by the gateway」，隔离是有意为之的；
+   顺带避免第二个 HTTP/2 会话去和主会话抢同一份凭证状态。
+2. **状态聚合只读** —— 不碰凭证、不发推理请求，纯把各模块的状态函数拼起来。
+
+---
+
+## 十二、路线图
 
 - [x] Node 选型 + Vercel 骨架 + wire 编解码
 - [x] **协议层 `pq.js`（请求装配 + 响应解析，字段号全部有字节码证据）**
@@ -485,4 +586,5 @@ Lgaaz { #1 STRING conversationId, #2 Lgauy }   ← protoreach 反推，字段号
 - [x] **ToS 门禁解除 + 账号级会话保持实证**
 - [x] **★ function calling 兼容层**（prompt 仿真，真实通道五场景全过，见 §六）
 - [x] **★ 空回复根因定案与修复**（idle 超时自造空回复 → 三态空闲宽限 + EOS 收尾，见 §九）
+- [x] **★ HTTP/2 会话半死自愈**（毒化销毁 + 轮换 + 心跳，修 issue #4，见 §十）
 - [ ] 多用户会话隔离评估（服务端按账号保持会话，见协议文档 §6）
