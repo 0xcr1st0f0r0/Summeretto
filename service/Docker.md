@@ -18,6 +18,31 @@ docker compose up -d --build
 > 两项留空不影响服务启动，缺项提示由服务自身给出。
 > 服务对外暴露时应将两项设置为强随机值。
 
+### 对外暴露时必须设 `PROXY_API_KEY`
+
+`docker-compose.yml` 默认 `PROXY_API_KEY: ""`，即**不校验调用方**。
+容器端口默认绑定 `0.0.0.0`，同网段任何设备都能直接调用并消耗你的 Google 配额。
+
+推荐把密钥放进 `service/.env`（该文件已被 `.gitignore` 与 `.dockerignore` 双重排除，
+不会进版本库、不会进镜像），再由 compose 注入：
+
+```bash
+# service/.env
+PROXY_API_KEY=<强随机，如 openssl rand -base64 32>
+```
+
+```yaml
+# docker-compose.yml / override
+environment:
+  PROXY_API_KEY: "${PROXY_API_KEY:-}"
+```
+
+设置后，调用方需携带 `x-goog-api-key: <值>` 或 `Authorization: Bearer <值>`。
+
+> `/healthz`、`/login`、`/admin` 三个路由不受 `PROXY_API_KEY` 保护——
+> 前者是诊断与容器健康检查入口，后两者各自用 `ADMIN_KEY` 独立鉴权。
+> 但 `/v1beta/*`（含 `/v1beta/models`）**全部**受保护。
+
 ## 1. 构建镜像
 
 ```bash

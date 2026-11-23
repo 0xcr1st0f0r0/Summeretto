@@ -41,11 +41,35 @@ UPSTREAM=http://127.0.0.1:3000 SHIM_PORT=8081 node openai-shim.mjs
 
 ```
 Base URL = http://127.0.0.1:8081/v1
-API Key  = 任意字符串
+API Key  = 见下方「鉴权」一节
 ```
 
-> 主服务若设置了 `PROXY_API_KEY`，客户端需带 `x-goog-api-key`（或 `Authorization: Bearer`），
-> 桥会原样透传；未设置时桥与主服务都不校验。
+### 鉴权（两个独立密钥）
+
+桥有两层凭据，**互相独立**，不要混用：
+
+| 环境变量 | 作用 | 谁需要知道 |
+|---|---|---|
+| `UPSTREAM_KEY` | 桥**调用主服务**时携带的凭据 | = 主服务的 `PROXY_API_KEY`（只有桥知道） |
+| `CLIENT_KEY` | 桥**要求客户端出示**的凭据 | 填进第三方客户端的 API Key |
+
+```bash
+# 主服务开鉴权时，桥必须自带凭据
+UPSTREAM=http://127.0.0.1:3000 \
+UPSTREAM_KEY=<主服务的 PROXY_API_KEY> \
+CLIENT_KEY=<给客户端的密钥> \
+node openai-shim.mjs
+```
+
+- `UPSTREAM_KEY` 留空 → 桥不注入凭据（适用于主服务未开鉴权的场景）
+- `CLIENT_KEY` 留空 → 桥不校验客户端（仅适合单机自用）
+
+> ★ 为什么不用「客户端的 key 直接透传」：那样客户端随便填个字符串就会把桥自己的
+> 出网请求一起打回 401（主服务校验的是它自己的 `PROXY_API_KEY`）。
+> 拆成两个密钥后，客户端填错只会被桥拒（401），不会影响桥到上游的链路。
+>
+> 主服务的 `/v1beta/*` 全路由都受 `PROXY_API_KEY` 保护（含 `/v1beta/models`），
+> 所以桥拉模型列表时同样会带上 `UPSTREAM_KEY`。
 
 ## 3. 端点映射
 
@@ -66,20 +90,50 @@ API Key  = 任意字符串
 | `content[]` 的 `{type:"image_url", image_url:{url:"data:…;base64,…"}}` | `parts: [{ inlineData: { mimeType, data } }]` |
 | `reasoning_effort` / `thinkingConfig.thinkingLevel` | `generationConfig.thinkingConfig.thinkingLevel` |
 | `temperature` / `top_p` / `max_tokens` | `generationConfig.temperature / topP / maxOutputTokens` |
+| `tools[]`（`{type:"function",function:{…}}` 或平铺 `{name,…}`） | `tools[].functionDeclarations[]` |
+| `tool_choice` | `toolConfig.functionCallingConfig` |
+| `messages[].tool_calls[]` | `parts: [{ functionCall: { name, args } }]` |
+| `messages[]` 中 `role:"tool"` | `parts: [{ text: "[Tool result for <name>]: …" }]` |
 
 响应侧：`finishReason` `STOP / MAX_TOKENS / SAFETY / RECITATION` → OpenAI
-`stop / length / content_filter / content_filter`；`usageMetadata` → `usage`。
+`stop / length / content_filter / content_filter`；`usageMetadata` → `usage`；
+`functionCall` part → `tool_calls[]`（详见 §4.1）。
 
 ## 4. 已知限制
 
 - **模型名不存在时主服务不报错，而是静默降级**到最低档位（实测传 `no-such-model`
   返回的是 `Used 3.5 Flash-Lite model`）。请从 `/v1/models` 拉取列表后再选，
   不要手敲模型名。
-- 工具调用 / function calling 未做结构化转换（本项目上游无工具声明位，
-  走的是 prompt 仿真，见 `lib/toolcall.js`）。`role: "tool"` 的消息会并入 user 轮。
 - 远程图片 URL 不做下载，按文本透传；只有 `data:` URI 能正确转成 `inlineData`。
 - 单请求体受主服务 `MAX_BODY_BYTES` 限制；大文件请走主服务的
   `POST /upload/v1beta/files` 分片上传，桥未做代理。
+
+### 4.1 工具调用（function calling）
+
+工具调用**已做结构化转换**，与原生链路等价：
+
+| 方向 | OpenAI 侧 | → | Gemini 原生侧 |
+|---|---|---|---|
+| 请求 | `tools: [{type:"function", function:{name,description,parameters}}]` | → | `tools: [{functionDeclarations:[{name,description,parameters}]}]` |
+| 请求 | `tool_choice: "none"` | → | `toolConfig.functionCallingConfig.mode = "NONE"` |
+| 请求 | `tool_choice: "required"` | → | `mode = "ANY"` |
+| 请求 | `tool_choice: {type:"function",function:{name}}` | → | `mode = "ANY"` + `allowedFunctionNames:[name]` |
+| 历史 | `assistant.tool_calls[]` | → | `functionCall` part |
+| 历史 | `role:"tool"` 消息 | → | `[Tool result for <name>]: <body>` 文本标记 |
+| 响应 | `tool_calls: [{id,type:"function",function:{name,arguments}}]` | ← | `functionCall` part |
+| 响应 | `finish_reason: "tool_calls"` | ← | 有 functionCall 时 |
+
+> ★ **为什么必须转**：Robin 私有协议没有独立的工具声明通道，主服务靠
+> `lib/toolcall.js` 做「prompt 仿真」（把声明序列化进提示词，再从模型输出的
+> ```function_call 围栏解析回填）。若桥把 `tools` 直接丢弃，模型会**静默凭自身
+> 知识编造答案**（实测问"北京天气"→编造 15°C 多云，`functionCall=0`，全程无报错）。
+> 静默错误比响亮失败危险得多。
+>
+> 桥转成原生形态后，由主服务统一做那套 prompt 仿真——桥不重复实现，
+> 以保证两条链路发给上游的请求**逐字一致**（实测 7 个场景全部一致）。
+
+> ⚠️ **工具模式下上游只返回 functionCall、没有正文**，这不是「空响应」。
+> 主服务的空响应重试与桥的 `EMPTY_RETRY` 都已排除这种情况（会白白重发并浪费额度）。
 
 ## 5. ★ 空回复与重试调优（请先读 §5.1）
 

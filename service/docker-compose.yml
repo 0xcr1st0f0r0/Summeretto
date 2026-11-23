@@ -15,7 +15,10 @@ services:
       ROBIN_ISOLATE_CONVERSATIONS: "1"
       ROBIN_EMPTY_RETRY: 1
       # 可选：下游调用密钥。留空则不校验调用方。
-      PROXY_API_KEY: ""
+      # ⚠️ 端口默认绑 0.0.0.0，同网段任何人可直连并消耗你的 Google 配额。
+      #    对外暴露时务必设置：把值写进 service/.env（已被 gitignore/dockerignore 排除），
+      #    此处用 ${PROXY_API_KEY:-} 注入。
+      PROXY_API_KEY: "${PROXY_API_KEY:-}"
       # 可选：凭证管理端点（/admin/gpsoauth、/admin/token）口令。
       # 留空则 admin 端点禁用，/login 页面提示绑定端点已禁用。
       ADMIN_KEY: ""
