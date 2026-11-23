@@ -443,6 +443,7 @@ const levelOf = () => {
     });
     assert.equal(r.status, 200);
     const body = await r.text();
+
     const chunks = body
       .split("\n\n")
       .filter((l) => l.startsWith("data: "))
@@ -452,6 +453,27 @@ const levelOf = () => {
     assert.equal(fcChunks[0].candidates[0].content.parts[0].functionCall.name, "get_weather");
     assert.ok(!body.includes("```function_call"), "SSE 不得泄漏围栏原文");
     ok("流式 tools：缓冲→解析→输出，functionCall chunk 正确且无围栏泄漏");
+  }
+
+  // 8.2b 空工具声明边界：tools: [{ functionDeclarations: [] }] 不吞字、正常流式输出正文
+  {
+    const r = await fetch(`${base}/v1beta/models/gemini-2.0-flash:streamGenerateContent`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: "你好，请讲个故事" }] }],
+        tools: [{ functionDeclarations: [] }],
+      }),
+    });
+    assert.equal(r.status, 200);
+    const body = await r.text();
+    const chunks = body
+      .split("\n\n")
+      .filter((l) => l.startsWith("data: "))
+      .map((l) => JSON.parse(l.slice(6)));
+    const text = chunks.map((c) => c.candidates?.[0]?.content?.parts?.[0]?.text ?? "").join("");
+    assert.ok(text.length > 0, `空工具声明不得吞字，实际返回字数=${text.length}`);
+    ok("空工具声明边界：tools: [{ functionDeclarations: [] }] 正常流式返回正文，不吞字");
   }
 
   // 8.3 工具历史：functionResponse part → [Tool result for …] 文本标记
@@ -566,6 +588,7 @@ const levelOf = () => {
     });
     assert.equal(r.status, 200);
     const body = await r.text();
+
     assert.equal(seen.modeHistory.length, before + 1, "流式降级也不得重试（应只 1 次请求）");
     assert.equal(seen.modeHistory.at(-1), ARGON, "流式请求同样按 argon 发出（不换将）");
     assert.ok(body.includes("流式"), "流式内容应原样输出");

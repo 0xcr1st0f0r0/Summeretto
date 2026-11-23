@@ -18,7 +18,7 @@
 
 /** 请求体是否携带工具/函数声明（google-genai SDK: tools=[{functionDeclarations:[…]}]） */
 export function hasToolDeclarations(body) {
-  return Array.isArray(body?.tools) && body.tools.length > 0;
+  return extractToolDefs(body).length > 0;
 }
 
 /**
@@ -28,10 +28,12 @@ export function hasToolDeclarations(body) {
 export function extractToolDefs(body) {
   const out = [];
   for (const group of body?.tools ?? []) {
-    for (const fn of group?.functionDeclarations ?? []) {
-      if (!fn?.name) continue;
-      const td = { name: fn.name, description: fn.description ?? "" };
-      const params = fn.parameters ?? fn.parametersJsonSchema;
+    const fns = group?.functionDeclarations ?? group?.function_declarations ?? [];
+    if (!Array.isArray(fns)) continue;
+    for (const fn of fns) {
+      if (!fn?.name || typeof fn.name !== "string" || !fn.name.trim()) continue;
+      const td = { name: fn.name.trim(), description: fn.description ?? "" };
+      const params = fn.parameters ?? fn.parametersJsonSchema ?? fn.parameters_json_schema;
       if (params) td.parameters = params;
       out.push(td);
     }

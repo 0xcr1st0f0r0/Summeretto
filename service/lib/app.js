@@ -313,6 +313,7 @@ async function attemptRobin(body, onDelta, modeId = null, thinkingLevel = null) 
     firstIdleMs: config.robinIdleFirstMs,
     idleAfterTextMs: config.robinIdleAfterTextMs,
     onFrame: (evt) => {
+
       if (evt.kind !== "response" || !evt.texts?.length) return;
       const cum = evt.texts[evt.texts.length - 1]; // 一帧内取最长者
       if (cum && cum !== prev) {
@@ -802,11 +803,13 @@ export async function handle(req, res) {
         let result = await callRobin(body, null, modeId, thinkingLevel, "streamGenerateContent");
         clearInterval(hb);
         const tr = resolveToolResult(body, result);
+        const rawText = result.cumulative || result.texts[result.texts.length - 1] || "";
+        const text = tr ? tr.cleanText : rawText;
         try {
-          if (result.error && !tr?.cleanText && !tr?.calls.length) {
+          if (result.error && !text && !tr?.calls.length) {
             res.write(sseData(geminiError(502, upstreamDiagnosis(result.error).message, "UNAVAILABLE")));
           } else {
-            if (tr?.cleanText) res.write(sseData(makeGeminiChunk(model, tr.cleanText)));
+            if (text) res.write(sseData(makeGeminiChunk(model, text)));
             for (const c of tr?.calls ?? []) res.write(sseData(makeGeminiFunctionCallChunk(model, c)));
             res.write(sseData(makeGeminiChunk(model, "", "STOP")));
           }

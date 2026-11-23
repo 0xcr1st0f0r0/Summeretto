@@ -333,7 +333,11 @@ const ok = (m) => {
   // 10.1 探测与提取
   assert.equal(hasToolDeclarations({}), false);
   assert.equal(hasToolDeclarations({ tools: [] }), false, "空 tools 数组不算声明");
-  assert.equal(hasToolDeclarations({ tools: [{ functionDeclarations: [] }] }), true);
+  assert.equal(hasToolDeclarations({ tools: [{ functionDeclarations: [] }] }), false, "空声明数组不算有效工具");
+  assert.equal(hasToolDeclarations({ tools: [{}] }), false, "空工具对象不算有效工具");
+  assert.equal(hasToolDeclarations({ tools: [{ function_declarations: [] }] }), false, "空 snake_case 数组不算有效工具");
+  assert.equal(hasToolDeclarations({ tools: [{ functionDeclarations: [{ name: "fn1" }] }] }), true, "有命名工具算有效声明");
+  assert.equal(hasToolDeclarations({ tools: [{ function_declarations: [{ name: "fn2" }] }] }), true, "snake_case 命名工具兼容");
   const defs = extractToolDefs({
     tools: [
       { functionDeclarations: [{ name: "get_weather", description: "查天气", parameters: { type: "object" } }] },
