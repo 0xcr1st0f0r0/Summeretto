@@ -3,6 +3,15 @@
 import { createServer } from "node:http";
 import { handle } from "./lib/app.js";
 import { enterRequest, exitRequest, inflightStatus } from "./lib/inflight.js";
+import { handleOpenAI } from "./openai-shim.mjs";
+
+function isOpenAICompatRoute(req) {
+  const path = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`).pathname;
+  return path === "/v1/models" ||
+    path === "/v1/chat/completions" ||
+    path === "/models" ||
+    path === "/chat/completions";
+}
 
 const server = createServer((req, res) => {
   // ★ 优雅停机：已开始关流时拒绝新请求，让调用方立刻失败并转投其他通道，
@@ -36,7 +45,17 @@ const server = createServer((req, res) => {
   res.on("close", done);
   res.on("finish", done);
 
-  handle(req, res).catch((err) => {
+  const openAIRequest = isOpenAICompatRoute(req);
+  // OpenAI routes are translated back into this server's Gemini routes.
+  const requestHandler = openAIRequest ? handleOpenAI : handle;
+  const options = openAIRequest
+    ? {
+        upstream: `http://127.0.0.1:${port}`,
+        upstreamKey: process.env.PROXY_API_KEY ?? "",
+        clientKey: process.env.PROXY_API_KEY ?? "",
+      }
+    : undefined;
+  requestHandler(req, res, options).catch((err) => {
     console.error("[server] unhandled:", err);
     if (!res.headersSent) {
       res.writeHead(500, { "content-type": "application/json; charset=utf-8" });

@@ -43,7 +43,7 @@ function slug(s) {
  */
 const MODES_STATIC = [
   { id: "8c46e95b1a07cecc", short: "Flash-Lite", label: "3.5 Flash-Lite", rank: 6 },
-  { id: "56fdd199312815e2", short: "Flash", label: "3.8 Flash", rank: 1 },
+  { id: "56fdd199312815e2", short: "Hydrogen", label: "4 Hydrogen", rank: 1 },
   { id: "e6fa609c3fa255c0", short: "Pro", label: "3.1 Pro", rank: 3 },
   { id: "95a4c0abcba24364", short: "Argon", label: "4 Argon", rank: 8 },
 ];

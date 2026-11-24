@@ -9,20 +9,13 @@
 // 跑法：node test/shim-auth.mjs
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-import os from "node:os";
-import { mkdtempSync, rmSync } from "node:fs";
+import { handleOpenAI } from "../openai-shim.mjs";
 
 let n = 0;
 const ok = (m) => {
   n++;
   console.log(`  [pass] ${m}`);
 };
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const SHIM = path.join(HERE, "..", "openai-shim.mjs");
 
 const UPSTREAM_KEY = "upstream-secret-key-for-test";
 const CLIENT_KEY = "client-secret-key-for-test";
@@ -46,33 +39,17 @@ const upstream = createServer((req, res) => {
 await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
 const upstreamPort = upstream.address().port;
 
-/* ── 起桥 ── */
-const shimPort = 19000 + (process.pid % 2000);
-const child = spawn(process.execPath, [SHIM], {
-  env: {
-    ...process.env,
-    SHIM_HOST: "127.0.0.1",
-    SHIM_PORT: String(shimPort),
-    UPSTREAM: `http://127.0.0.1:${upstreamPort}`,
-    UPSTREAM_KEY,
-    CLIENT_KEY,
-    EMPTY_RETRY: "0",
-  },
-  stdio: ["ignore", "pipe", "pipe"],
+/* ── Start an in-process compatibility route ── */
+const compat = createServer((req, res) => {
+  handleOpenAI(req, res, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    upstreamKey: UPSTREAM_KEY,
+    clientKey: CLIENT_KEY,
+  }).catch(() => {});
 });
-child.stderr.on("data", (d) => process.stderr.write(`[shim] ${d}`));
-
-// 等桥起来
-for (let i = 0; i < 50; i++) {
-  try {
-    await fetch(`http://127.0.0.1:${shimPort}/healthz`);
-    break;
-  } catch {
-    await new Promise((r) => setTimeout(r, 100));
-  }
-}
-const base = `http://127.0.0.1:${shimPort}`;
-ok(`桥已启动 ${base}（假上游 :${upstreamPort} 已开启鉴权）`);
+await new Promise((r) => compat.listen(0, "127.0.0.1", r));
+const base = `http://127.0.0.1:${compat.address().port}`;
+ok(`兼容路由已启动 ${base}（假上游 :${upstreamPort} 已开启鉴权）`);
 
 const chat = (headers) =>
   fetch(`${base}/v1/chat/completions`, {
@@ -122,9 +99,8 @@ try {
     ok("⑤ /v1/models 同样受 CLIENT_KEY 保护");
   }
 } finally {
-  child.kill();
+  compat.close();
   upstream.close();
-  rmSync(mkdtempSync(path.join(os.tmpdir(), "shim-auth-")), { recursive: true, force: true });
 }
 
 console.log(`\n全部通过：${n} 组断言`);
