@@ -19,20 +19,15 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { createServer as createHttpServer } from "node:http2";
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
 import { GrpcFrameDecoder, grpcFrame } from "../lib/wire.js";
 import { buildServerFrame } from "./mock-robin.mjs";
+import { handleOpenAI } from "../openai-shim.mjs";
 
 let n = 0;
 const ok = (m) => {
   n++;
   console.log(`  [pass] ${m}`);
 };
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const SHIM = path.join(HERE, "..", "openai-shim.mjs");
 
 /* ── 假上游（h2c）：模拟真实上游返回带 function_call 围栏的模型输出 ── */
 const upstream = createHttpServer();
@@ -73,29 +68,11 @@ const app = createServer((req, res) => {
 await new Promise((r) => app.listen(0, "127.0.0.1", r));
 const base = `http://127.0.0.1:${app.address().port}`;
 
-/* ── 起桥 ── */
-const shimPort = 19100 + (process.pid % 500);
-const child = spawn(process.execPath, [SHIM], {
-  env: {
-    ...process.env,
-    SHIM_HOST: "127.0.0.1",
-    SHIM_PORT: String(shimPort),
-    UPSTREAM: base,
-    EMPTY_RETRY: "0",
-  },
-  stdio: ["ignore", "pipe", "pipe"],
-});
-child.stderr.on("data", (d) => process.stderr.write(`[shim] ${d}`));
-for (let i = 0; i < 60; i++) {
-  try {
-    await fetch(`http://127.0.0.1:${shimPort}/healthz`);
-    break;
-  } catch {
-    await new Promise((r) => setTimeout(r, 100));
-  }
-}
-const shim = `http://127.0.0.1:${shimPort}`;
-ok(`桥已启动 ${shim}（假上游 :${upstreamPort}）`);
+/* ── Start compatibility route in-process ── */
+const compat = createServer((req, res) => handleOpenAI(req, res, { upstream: base }).catch(() => {}));
+await new Promise((r) => compat.listen(0, "127.0.0.1", r));
+const shim = `http://127.0.0.1:${compat.address().port}`;
+ok(`兼容路由已启动 ${shim}（假上游 :${upstreamPort}）`);
 
 const TOOLS = [
   {
@@ -207,26 +184,12 @@ try {
     await new Promise((r) => spy.listen(0, "127.0.0.1", r));
     const spyPort = spy.address().port;
 
-    const spyShimPort = shimPort + 1;
-    const spyChild = spawn(process.execPath, [SHIM], {
-      env: {
-        ...process.env,
-        SHIM_HOST: "127.0.0.1",
-        SHIM_PORT: String(spyShimPort),
-        UPSTREAM: `http://127.0.0.1:${spyPort}`,
-        EMPTY_RETRY: "0",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    for (let i = 0; i < 60; i++) {
-      try {
-        await fetch(`http://127.0.0.1:${spyShimPort}/healthz`);
-        break;
-      } catch {
-        await new Promise((r) => setTimeout(r, 100));
-      }
-    }
-    await fetch(`http://127.0.0.1:${spyShimPort}/v1/chat/completions`, {
+    const spyCompat = createServer((req, res) =>
+      handleOpenAI(req, res, { upstream: `http://127.0.0.1:${spyPort}` }).catch(() => {}),
+    );
+    await new Promise((r) => spyCompat.listen(0, "127.0.0.1", r));
+    const spyBase = `http://127.0.0.1:${spyCompat.address().port}`;
+    await fetch(`${spyBase}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -246,7 +209,7 @@ try {
     ok("④ 请求侧：OpenAI tools → Gemini tools/functionDeclarations");
 
     /* ⑤ tool_choice 映射 */
-    await fetch(`http://127.0.0.1:${spyShimPort}/v1/chat/completions`, {
+    await fetch(`${spyBase}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -260,7 +223,7 @@ try {
     const b2 = seen[seen.length - 1];
     assert.equal(b2?.toolConfig?.functionCallingConfig?.mode, "NONE", "tool_choice=none → mode NONE");
 
-    await fetch(`http://127.0.0.1:${spyShimPort}/v1/chat/completions`, {
+    await fetch(`${spyBase}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -281,7 +244,7 @@ try {
     ok("⑤ tool_choice 映射：none → NONE，指定函数 → ANY + 白名单");
 
     /* ⑥ 历史侧：assistant.tool_calls 与 role:tool */
-    await fetch(`http://127.0.0.1:${spyShimPort}/v1/chat/completions`, {
+    await fetch(`${spyBase}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -316,11 +279,11 @@ try {
     );
     ok("⑥ 历史侧：assistant.tool_calls → functionCall part；role:tool → 工具结果标记");
 
-    spyChild.kill();
+    spyCompat.close();
     spy.close();
   }
 } finally {
-  child.kill();
+  compat.close();
   upstream.close();
   app.close();
 }
